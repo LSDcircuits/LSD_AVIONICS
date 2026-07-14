@@ -6,7 +6,9 @@ typedef struct {
 } KF1D;
 
 void kf_update(KF1D *kf, float z) {
-    // Predict
+    // Prediction step
+    // theres a known variance and a noise created by the program which can be derived,
+    // these together give the prediction spread. 
     float P_pred = kf->P + kf->Q;
     
     // Update
