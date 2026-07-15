@@ -1,0 +1,21 @@
+# 1. Create the directory
+mkdir -p /Users/lsd/Embedded/Python_simulations
+cd /Users/lsd/Embedded/Python_simulations
+
+# 2. Create virtual environment
+python3 -m venv venv
+
+# 3. Activate it
+#    macOS/Linux:
+source venv/bin/activate
+#    Windows:
+#    venv\Scripts\activate
+
+# 4. Install dependencies
+pip install numpy matplotlib
+
+# 5. Move the downloaded files here (if not already)
+#    (drag kf1d_interactive.py and kf1d_modules_cheatsheet.txt into this folder)
+
+# 6. Run it
+python kf1d_interactive.py
