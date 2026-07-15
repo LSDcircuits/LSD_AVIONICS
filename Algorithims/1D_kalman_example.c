@@ -1,8 +1,8 @@
 typedef struct {
     float h;      // altitude estimate <- this is the value used for height (never 100% certain so called estimate)
     float P;      // current uncertanty <- based on Prediction and Kalman gain.
-    float Q;      // process noise 
-    float R;      // barometer noise from Data sheet, how wrong could the sensor be
+    float Q;      // process noise <- uncertanty of prediction model.
+    float R;      // barometer noise <- uncertanty of measurement. 
 } KF1D;
 
 void kf_update(KF1D *kf, float z) {
