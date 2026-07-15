@@ -1,13 +1,13 @@
 typedef struct {
     float h;      // altitude estimate <- this is the value used for height (never 100% certain so called estimate)
-    float P;      // variance <- initial estimate
+    float P;      // current uncertanty 
     float Q;      // process noise 
     float R;      // barometer noise from Data sheet, how wrong could the sensor be
 } KF1D;
 
 void kf_update(KF1D *kf, float z) {
     // Prediction step
-    // P = P0 from first loop is a initial estimate & P_pred is the new estimate with added Process noise
+    // P_pred is the predicted covariance (how uncertain you are before looking at the sensor).
     float P_pred = kf->P + kf->Q;
     
     // Update
