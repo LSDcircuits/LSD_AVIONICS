@@ -1,6 +1,5 @@
 # 1. Create the directory
-mkdir -p /Users/lsd/Embedded/Python_simulations
-cd /Users/lsd/Embedded/Python_simulations
+mkdir -p /directory
 
 # 2. Create virtual environment
 python3 -m venv venv
