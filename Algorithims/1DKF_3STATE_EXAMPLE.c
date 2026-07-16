@@ -1,5 +1,7 @@
 #include <math.h>
 
+// this one will take a hefty ammoun of time. 
+
 typedef struct {
     float h;        // height [m]
     float v;        // velocity [m/s]
