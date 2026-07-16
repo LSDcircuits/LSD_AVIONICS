@@ -1,7 +1,7 @@
 typedef struct {
     float Q;      // process noise <- uncertanty of prediction model.
                   // where to get Q from? from 2 samples how much can the altitude realistically change?
-                  // If a aicraft has 1 m/s vertical speed, rate is 10HZ = 0.1s max expected vertical measurment is 0.1m or 10cm.
+                  // If a aicraft has max 1 m/s vertical speed, rate is 10HZ = 0.1s max expected vertical measurment is 0.1m or 10cm.
                   // since its a prediction we can call it the standard deviation of the current model, Q must be in variance so it must be squared 
                   // so Q = (0.1)^2 = 0.01 m^2  (for the prediction step)
 
@@ -9,11 +9,13 @@ typedef struct {
                   // This is used for the update step, its important for the update step since it controlls the gain used for the next prediciton
                   // this directly effect the value of K and the updated P 
 
-    float P;      // current uncertanty <- based on Prediction and Kalman gain.
+    float P;      // current uncertanty <- based on Prediction and Kalman gain. P converges based on Q & R values
+
 
     float h;      // altitude estimate <- this is the value used for height (never 100% certain so called estimate)
 
 } KF1D;
+
 
 void kf_update(KF1D *kf, float z) {
     // Prediction step
@@ -31,6 +33,8 @@ void kf_update(KF1D *kf, float z) {
     // when the noise is very high the denominator dominates bringing the K value down. 
     // A importnat disticntion of K is that it represents the confidence of the sensor relative to the predicttion. 
     
-    kf->h = kf->h + K * y; // update step 
-    kf->P = (1.0f - K) * P_pred; // 
+    kf->h = kf->h + K * y; // update step (prediction), this step updates the new prediction value, it takes (z - h) = y difference in height measured, multiplies it by 
+                           // the kallman gain and adds it to the previous prediction. 
+    
+    kf->P = (1.0f - K) * P_pred; // this update represent how cetrain i am after looking a the sensor, (1 - K) 
 }
