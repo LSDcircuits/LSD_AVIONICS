@@ -22,7 +22,6 @@
 #define G_TO_MS2            9.80665f
 
 // Register map
-// [DS: Sec 8, Table 16] Register address map
 #define WHO_AM_I        0x0F
 #define FIFO_CTRL1      0x06
 #define FIFO_CTRL2      0x07
@@ -44,24 +43,28 @@
 #define TIMESTAMP1_REG  0x41
 #define TIMESTAMP2_REG  0x42
 
-// One FIFO packet with our config = 3 datasets x 3 words = 9 words = 18 bytes
-#define NAV_PACKET_WORDS  9
-#define NAV_PACKET_BYTES  18
+// FIFO packet: Gyro (3 words) + Accel (3 words) = 6 words = 12 bytes.
+// Timestamp is NOT stored in the FIFO with this config; read from dedicated registers.
+#define NAV_PACKET_WORDS  6
+#define NAV_PACKET_BYTES  12
 
-// Navigation sample: raw int16 + sensor timestamp + host timestamp.
 typedef struct {
     int16_t  gx, gy, gz;
     int16_t  ax, ay, az;
     uint32_t sensor_ts;      // LSM6DS3 24-bit timestamp (25 µs/LSB, wraps at 2^24)
-    uint64_t host_ts_us;     // RP2040 time_us_64() at read time (READ time, not sample time)
+    uint64_t host_ts_us;     // RP2040 time_us_64() at read time
 } imu_nav_sample;
 
-// chip select
+typedef struct {
+    float gx_off, gy_off, gz_off;
+    float ax_off, ay_off, az_off;
+} imu_cal_t;
+
+static imu_cal_t cal = {0};
+
 static inline void cs_low(void)  { gpio_put(PIN_CS, 0); }
 static inline void cs_high(void) { gpio_put(PIN_CS, 1); }
 
-// Low-level SPI helpers
-// [DS: Sec 6.2, Figure 8-13] SPI read/write protocols (Mode 3)
 static void reg_write(uint8_t reg, uint8_t val) {
     uint8_t tx[2] = { (uint8_t)(reg & 0x7F), val };
     cs_low();
@@ -77,41 +80,33 @@ static void reg_read(uint8_t reg, uint8_t *dst, size_t n) {
     cs_high();
 }
 
-// Reset/flush the FIFO: drop to Bypass mode (clears content) then back to
-// Continuous mode. [DS: Sec 5.4.1/5.4.2] "Bypass mode is also used to reset
-// the FIFO". Keeps ODR_FIFO = 1.66 kHz in both writes.
 static void fifo_reset(void) {
-    reg_write(FIFO_CTRL5, 0x40);   // ODR_FIFO=1000, FIFO_MODE=000 (Bypass) -> flush
-    reg_write(FIFO_CTRL5, 0x46);   // ODR_FIFO=1000, FIFO_MODE=110 (Continuous)
+    // Bypass mode immediately clears the FIFO.
+    reg_write(FIFO_CTRL5, 0x00);
+    sleep_us(50);
+    // Restore continuous mode at 1.66 kHz.
+    reg_write(FIFO_CTRL5, 0x46);
+    sleep_us(50);
 }
 
-// Check whether at least one complete packet is stored.
-// A packet = Gyro set (3 words) + Accel set (3 words) + TS/Step set (3 words) = 9 words.
-// [DS: Sec 9.52/9.53] DIFF_FIFO is 12 bits: FIFO_STATUS1 = low 8 bits,
-// FIFO_STATUS2[3:0] = high 4 bits  -> mask MUST be 0x0F (your 0x03 truncated it).
 static bool nav_sample_available(void) {
     uint8_t st[2];
     reg_read(FIFO_STATUS1, st, 2);
-
     // OVER_RUN: at least one sample was overwritten -> stream can no longer be
     // trusted to be contiguous. Flush and wait for fresh aligned data.
     if (st[1] & 0x40) {
         fifo_reset();
         return false;
     }
-
     uint16_t words = st[0] | ((uint16_t)(st[1] & 0x0F) << 8);
     return words >= NAV_PACKET_WORDS;
 }
 
-// Sync guard: FIFO_PATTERN[9:0] (FIFO_STATUS3/4) is the index of the NEXT word
-// to be read inside the repeating dataset pattern. With our 9-word pattern it
-// cycles 0..8, and 0 means "next word = gyro X of a new packet". If we ever
-// lose alignment (e.g. after an overrun), reset instead of decoding garbage.
 static bool fifo_packet_aligned(void) {
     uint8_t pat[2];
     reg_read(FIFO_STATUS3, pat, 2);
     uint16_t pattern = pat[0] | ((uint16_t)(pat[1] & 0x03) << 8);
+    // Pattern 0 means the next word is gyro X (start of a 6-word group).
     return (pattern % NAV_PACKET_WORDS) == 0;
 }
 
@@ -127,17 +122,7 @@ bool imu_read_burst(imu_nav_sample *s) {
     // Host read timestamp — metadata about WHEN YOU READ, not sample time.
     s->host_ts_us = time_us_64();
 
-    // 18-byte burst from FIFO_DATA_OUT_L; IF_INC=1 (CTRL3_C) makes the chip
-    // walk the FIFO word by word. Packet layout with our config:
-    //   raw[ 0.. 5] = gyro  X,Y,Z  (little-endian int16)
-    //   raw[ 6..11] = accel X,Y,Z  (little-endian int16)
-    //   raw[12..17] = 4th dataset (AN4650 Table 75, NOT plain little-endian):
-    //       raw[12] = TIMESTAMP[15:8]
-    //       raw[13] = TIMESTAMP[23:16]
-    //       raw[14] = unused
-    //       raw[15] = TIMESTAMP[7:0]
-    //       raw[16] = STEPS[7:0]   (pedometer, ignore if unwanted)
-    //       raw[17] = STEPS[15:8]
+    // 12-byte burst from FIFO_DATA_OUT_L; IF_INC=1 (CTRL3_C) auto-increments address.
     uint8_t raw[NAV_PACKET_BYTES];
     reg_read(FIFO_DATA_OUT_L, raw, NAV_PACKET_BYTES);
 
@@ -148,14 +133,17 @@ bool imu_read_burst(imu_nav_sample *s) {
     s->ay = (int16_t)((raw[9]  << 8) | raw[8]);
     s->az = (int16_t)((raw[11] << 8) | raw[10]);
 
-    s->sensor_ts = ((uint32_t)raw[13] << 16) |   // TS[23:16]
-                   ((uint32_t)raw[12] << 8)  |   // TS[15:8]
-                   raw[15];                      // TS[7:0]
+    // Read 24-bit timestamp from dedicated registers (NOT the FIFO).
+    // TIMESTAMP0_REG = 0x40; auto-increment (IF_INC=1) reads 0x40, 0x41, 0x42.
+    uint8_t ts[3];
+    reg_read(TIMESTAMP0_REG, ts, 3);
+    s->sensor_ts = ((uint32_t)ts[2] << 16) | ((uint32_t)ts[1] << 8) | (uint32_t)ts[0];
+
     return true;
 }
 
 static bool imu_init(void) {
-   // [DS: Sec 4.4.1, Table 6] SPI @ 10 MHz, Mode 3 (CPOL=1, CPHA=1)
+    // [DS: Sec 4.4.1, Table 6] SPI @ 10 MHz, Mode 3 (CPOL=1, CPHA=1)
     spi_init(IMU_SPI, 10 * 1000 * 1000);
     spi_set_format(IMU_SPI, 8, true, true, SPI_MSB_FIRST);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
@@ -176,52 +164,61 @@ static bool imu_init(void) {
         return false;
     }
 
-   // [DS: Sec 9.14, Table 52-53] CTRL3_C: BDU=1, IF_INC=1
-    reg_write(CTRL3_C, 0x44);
-
-   // [DS: Sec 9.12, Table 45-47] CTRL1_XL: ODR 1.66 kHz, FS ±16 g, BW 400 Hz
-    reg_write(CTRL1_XL, 0x84);
-
-   // [DS: Sec 9.13, Table 49-51] CTRL2_G: ODR 1.66 kHz, FS ±2000 dps
-    reg_write(CTRL2_G, 0x8C);
-
-   // [DS: Sec 9.21] CTRL10_C: FUNC_EN=1 (needed for timestamp/pedo dataset).
-   // Default 0x38 keeps gyro X/Y/Z enabled — don't write a bare 0x04.
+    // Core settings
+    reg_write(CTRL3_C, 0x44);      // IF_INC=1, BDU=1
+    reg_write(CTRL1_XL, 0x84);     // XL 1.66 kHz, ±16 g
+    reg_write(CTRL2_G, 0x8C);      // Gyro 1.66 kHz, ±2000 dps
     reg_write(CTRL10_C, 0x3C);
-
-   // [DS: Sec 9.85] TAP_CFG: TIMER_EN=1 (bit7) + PEDO_EN=1 (bit6)
-   // per AN4650 Sec 8.8 procedure for timestamp+step in FIFO.
     reg_write(TAP_CFG, 0xC0);
+    reg_write(WAKE_UP_DUR, 0x10);  // Timer enabled (bit 4 = TIMER_EN)
 
-   // [DS: Sec 9.76, Table 184-185] TIMER_HR=1 -> timestamp resolution 25 µs/LSB
-    reg_write(WAKE_UP_DUR, 0x10);
+    // --- FIFO config: gyro + accel ONLY, no timestamp inside FIFO ---
+    // FIFO_CTRL3 layout: [0][0][DEC_GYRO2:0][DEC_XL2:0]
+    // 0x09 = 0b00001001 -> both gyro & XL at 001 = no decimation.
+    // DO NOT set bit 7 or 6 to 1; the datasheet requires them to be 0.
+    reg_write(FIFO_CTRL1, 0x06);   // Watermark = 6 words (1 packet)
+    reg_write(FIFO_CTRL2, 0x00);   // No timer/step/temp in FIFO
+    reg_write(FIFO_CTRL3, 0x09);   // Gyro + XL, both no decimation
+    reg_write(FIFO_CTRL4, 0x00);   // No 3rd/4th datasets
+    reg_write(FIFO_CTRL5, 0x00);   // Bypass first to clear any old/stale data
+    sleep_us(50);
+    reg_write(FIFO_CTRL5, 0x46);   // Continuous mode, 1.66 kHz FIFO ODR
+    sleep_us(50);
 
-    // [DS: Sec 9.3/9.4] FTH = 9 words = exactly one packet
-    reg_write(FIFO_CTRL1, 0x09);
+    return true;
+}
 
-    // [DS: Sec 9.4] TIMER_PEDO_FIFO_EN=1 -> 4th dataset = step counter + timestamp;
-    // TIMER_PEDO_FIFO_DRDY=0 -> FIFO writes triggered by XL/Gyro data-ready
-    reg_write(FIFO_CTRL2, 0x80);
+static bool calibrate_gyro(uint16_t samples) {
+    int32_t sum_gx = 0, sum_gy = 0, sum_gz = 0;
+    uint16_t collected = 0;
+    uint16_t discard = 50;   // discard first 50 packets to let sensor settle
 
-    // [DS: Sec 9.5] gyro & accel: no decimation (both at full FIFO ODR)
-    reg_write(FIFO_CTRL3, 0x09);
-
-    // [DS: Sec 9.6, Table 29-32]
-    //  DEC_DS4_FIFO[5:3] = 001 -> 4th dataset NO decimation (timestamp every packet)
-    //  DEC_DS3_FIFO[2:0] = 000 -> 3rd dataset not in FIFO
-    //  (0x10 was DEC_DS4=010 = ÷2 -> alternating 9-word/6-word packets: the bug)
-    reg_write(FIFO_CTRL4, 0x08);
-
-    // Flush anything collected while configuring, then start Continuous mode.
+    // Drain stale FIFO data first
     fifo_reset();
 
-    // Reset the 24-bit timestamp counter so t=0 is a known epoch.
-    // [DS: Sec 9.60] writing 0xAA to TIMESTAMP2_REG resets it.
-    reg_write(TIMESTAMP2_REG, 0xAA);
+    while (collected < samples + discard) {
+        if (!nav_sample_available()) {
+            tight_loop_contents();   // non-blocking wait
+            continue;
+        }
 
-    // [DS: Sec 5.4] first sample after FIFO mode switch must be discarded —
-    // the flush above empties the FIFO, and we simply let fresh data refill it.
-    sleep_ms(5);
+        imu_nav_sample s;
+        if (!imu_read_burst(&s)) continue;
+
+        if (collected >= discard) {
+            sum_gx += s.gx;
+            sum_gy += s.gy;
+            sum_gz += s.gz;
+        }
+        collected++;
+    }
+
+    cal.gx_off = (float)sum_gx / (float)samples;
+    cal.gy_off = (float)sum_gy / (float)samples;
+    cal.gz_off = (float)sum_gz / (float)samples;
+
+    printf("Gyro offsets: X=%.2f Y=%.2f Z=%.2f LSB\n",
+           cal.gx_off, cal.gy_off, cal.gz_off);
     return true;
 }
 
@@ -232,6 +229,10 @@ int main(void) {
         while (true) { tight_loop_contents(); }
     }
 
+    printf("Keep IMU stationary for calibration...\n");
+    sleep_ms(500);
+    calibrate_gyro(512);
+
     imu_nav_sample s;
     uint32_t print_decim = 0;
     uint32_t prev_sensor_ts = 0;
@@ -239,10 +240,10 @@ int main(void) {
 
     while (true) {
         if (imu_read_burst(&s)) {
-            /* ---- Scale to physical units (keep raw ints in struct for your KF) ---- */
-            float gx_dps = s.gx * GYRO_2000DPS_SENS;
-            float gy_dps = s.gy * GYRO_2000DPS_SENS;
-            float gz_dps = s.gz * GYRO_2000DPS_SENS;
+            // Scale to physical units (keep raw ints in struct for your KF)
+            float gx_dps = (s.gx - cal.gx_off) * GYRO_2000DPS_SENS;
+            float gy_dps = (s.gy - cal.gy_off) * GYRO_2000DPS_SENS;
+            float gz_dps = (s.gz - cal.gz_off) * GYRO_2000DPS_SENS;
 
             float ax_g   = s.ax * ACC_16G_SENS_G;
             float ay_g   = s.ay * ACC_16G_SENS_G;
@@ -253,13 +254,11 @@ int main(void) {
             float az_ms2 = az_g * G_TO_MS2;
 
             // Sample-to-sample sensor-time delta, wrap-safe over the 24-bit counter.
-            // Expect ~24 ticks (24 x 25 µs = 600 µs = 1/1.66 kHz).
             uint32_t dt_ticks = have_prev ? ((s.sensor_ts - prev_sensor_ts) & 0xFFFFFFu) : 0;
             prev_sensor_ts = s.sensor_ts;
             have_prev = true;
 
-            /* USB stdio cannot sustain 1.66 kHz prints; decimate for human viewing.
-               Your quaternion/Kalman code will consume *every* sample, not print them. */
+            // USB stdio cannot sustain 1.66 kHz prints; decimate for human viewing.
             if (++print_decim >= 100) {
                 print_decim = 0;
                 printf("G:%7.2f %7.2f %7.2f dps | "
@@ -270,6 +269,7 @@ int main(void) {
                        ax_ms2, ay_ms2, az_ms2,
                        (unsigned long)s.sensor_ts, (unsigned long)dt_ticks,
                        s.host_ts_us);
+                sleep_ms(1);
             }
         }
     }
