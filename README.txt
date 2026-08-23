@@ -1,5 +1,7 @@
 LSD_AVIONICS
-Repository dedicated to designing algorithms used for avionics in embedded systems. 
+Repository dedicated to designing algorithms & testing used for avionics in embedded systems for fumca.
+
+Main process(to be optimized if needed)
 
 IMU (gyro, accel, mag)
     │
@@ -17,14 +19,11 @@ IMU (gyro, accel, mag)
             │
             └──→ GPS arrives ──→ Kalman update (correct position/velocity)
 
-1. Kalman filter
+The PIPELINES made in PICO RP2350 used to test sensors, the code structure is kept using the higher level functions from the pico-sdk so the entire bus fabric is handled by the function provided by the vendor sdk. The pipelines are kept at register level for more flexible compatability with other controllers such as the STM32's or NXP LPC series. the pipelines are a small part of the project which need to be well defined for predictable uses when filtering nouse or integrating data into usable values.
 
-   - 1D single input linear Kallman filter (barometer example)
+Algorithms, this section is used to describe different algorithms used for filtering any data but also for planning the architecture since its heavily time based and the rp2350 has 2 arm cores which is what will be used alternatively it can also be split to the risk 5 cores it has but then would require different architecture planning affecting how algorithms are applied. 
 
 
-temp note to my self:
-Linear algebra pracitce (to complete)
 
-- week 1
-- week 3
-- week 5 
+
+
