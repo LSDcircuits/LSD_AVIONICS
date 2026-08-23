@@ -88,9 +88,9 @@ static bool imu_read_polled(imu_nav_sample *s) {
     return true;
 }
 
-// -----------------------------------------------------------------------------
+
 // Mahony 6DOF attitude estimator
-// -----------------------------------------------------------------------------
+
 static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // w, x, y, z  (body relative to NED)
 static float gyro_bias_mahony[3] = {0.0f, 0.0f, 0.0f};
 static uint64_t last_attitude_us = 0;
@@ -150,7 +150,7 @@ static void mahony_update(float gx_rad, float gy_rad, float gz_rad,
     }
 }
 
-// Convert quaternion to Euler angles (radians) for human debugging
+// Convert quaternion to Euler angles (radians) 
 static void quat_to_euler(const float quat[4], float *roll, float *pitch, float *yaw)
 {
     float w = quat[0], x = quat[1], y = quat[2], z = quat[3];
@@ -159,9 +159,9 @@ static void quat_to_euler(const float quat[4], float *roll, float *pitch, float 
     *yaw   = atan2f(2.0f*(w*z + x*y), 1.0f - 2.0f*(y*y + z*z));
 }
 
-// -----------------------------------------------------------------------------
+
 // Init
-// -----------------------------------------------------------------------------
+
 static bool imu_init(void) {
     spi_init(IMU_SPI, 10 * 1000 * 1000);
     spi_set_format(IMU_SPI, 8, true, true, SPI_MSB_FIRST);
@@ -191,9 +191,8 @@ static bool imu_init(void) {
     return true;
 }
 
-// -----------------------------------------------------------------------------
+
 // Calibration
-// -----------------------------------------------------------------------------
 static bool calibrate_gyro(uint16_t samples) {
     int32_t sum_x = 0, sum_y = 0, sum_z = 0;
     uint16_t discard = 100;
@@ -220,9 +219,8 @@ static bool calibrate_gyro(uint16_t samples) {
     return true;
 }
 
-// -----------------------------------------------------------------------------
+
 // Main
-// -----------------------------------------------------------------------------
 int main(void) {
     stdio_init_all();
     sleep_ms(200);
