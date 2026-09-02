@@ -5,7 +5,7 @@ Main process(to be optimized if needed)
 
 IMU (gyro, accel, mag)
     │
-    ├──→ Madgwick ──→ Quaternion ──→ Attitude (roll, pitch, yaw)
+    ├──→ Mahony ──→ Quaternion ──→ Attitude (roll, pitch, yaw)
     │                      │
     │                      └──→ Rotation matrix R
     │                              │
