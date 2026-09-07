@@ -1,0 +1,7 @@
+This folder is dedicated to inholland part of the internship.
+Here my supervisors can see my files and updates on my work through commits.
+
+used for:
+- Monitoring 
+- sorting
+- backing up
