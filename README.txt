@@ -31,7 +31,7 @@ Simulations, this section is used to test different algorithms and performance i
 
 Drafts, this section consist of documentation used for the code ive constructed for the RP2350 but also important explanations of the maths used to derive specific outputs such as quaternions and how they're used for rotation but also how much process noise is created from this method which is very important for prediction steps on kallman filters.
 
-This project is slightly over a month old and is in its initial phase. 
+
 
 
 
