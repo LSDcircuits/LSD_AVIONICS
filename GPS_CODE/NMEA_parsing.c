@@ -1,106 +1,102 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
 
-// UART config
-#define GPS_UART        uart0
-#define GPS_BAUD        38400     // try 9600 if you see garbage
-#define GPS_TX_PIN      0         // Pico TX -> GPS RX
-#define GPS_RX_PIN      1         // Pico RX <- GPS TX
+// ---------- config ----------
+#define GPS_UART    uart0
+#define GPS_BAUD    38400     // try 9600 if you see garbage
+#define GPS_TX_PIN  0         // Pico TX -> GPS RX
+#define GPS_RX_PIN  1         // Pico RX <- GPS TX
 
-#define LINE_BUF_LEN    128
-#define MAX_FIELDS      24
+#define LINE_BUF    100
+#define MAX_FIELDS  16
 
+// ---------- tiny NMEA float parser (ddmm.mmm or ddd.dd) ----------
+static bool nmea_flt(const char *s, float *out) {
+    if (!s || s[0] == '\0') return false;
+    bool neg = (*s == '-');
+    if (neg) s++;
+    long ip = 0;
+    while (*s >= '0' && *s <= '9') ip = ip * 10 + (*s++ - '0');
+    float val = (float)ip;
+    if (*s == '.') {
+        s++;
+        float scale = 0.1f;
+        while (*s >= '0' && *s <= '9') {
+            val += (float)(*s++ - '0') * scale;
+            scale *= 0.1f;
+        }
+    }
+    if (*s != '\0') return false;   // junk in the field
+    *out = neg ? -val : val;
+    return true;
+}
 
-// XOR of chars between '$' and '*'. Returns 0 if sentence is malformed.
-static bool nmea_checksum_ok(const char *s) {
+// "4916.45" + 'N' -> +49.27417
+static bool nmea_deg(const char *v, char hemi, bool is_lat, float *out) {
+    float raw;
+    if (!nmea_flt(v, &raw)) return false;
+    int deg = (int)(raw / 100.0f);
+    float m   = raw - (float)deg * 100.0f;
+    float r   = (float)deg + m / 60.0f;
+    if (hemi == 'S' || hemi == 'W') r = -r;
+    *out = r;
+    return true;
+}
+
+static bool nmea_cksum_ok(const char *s) {
     if (s[0] != '$') return false;
     uint8_t cs = 0;
     const char *p = s + 1;
     while (*p && *p != '*') cs ^= (uint8_t)*p++;
     if (*p != '*') return false;
-    unsigned int sent;
-    return (sscanf(p + 1, "%2X", &sent) == 1) && (sent == cs);
+    unsigned int got;
+    return (sscanf(p + 1, "%2X", &got) == 1) && (got == cs);
 }
 
-// Split a,b,, in place -> fields[] = {"a","b","","c"}. Returns field count.
-static int nmea_split(char *s, char **fields, int max_fields) {
-    int n = 0;
-    char *p = s;
-    fields[n++] = p;
-    while (*p && n < max_fields) {
-        if (*p == ',') {
-            *p = '\0';
-            fields[n++] = p + 1;
-        }
+// ---------- RMC parse ----------
+// $GNRMC,time,status,lat,N,lon,E,speed_knots,course_deg,date,...
+typedef struct {
+    bool  valid;
+    float lat, lon;      // decimal degrees
+    float speed_kmh;     // km/h
+    float course;        // heading over ground, degrees true
+} nav_t;
+
+static bool parse_rmc(char *line, nav_t *n) {
+    if (!nmea_cksum_ok(line)) return false;
+    if (strncmp(line + 3, "RMC", 3) != 0) return false;
+
+    char *f[MAX_FIELDS];
+    int cnt = 0;
+    char *p = line + 7;                    // skip "$xxRMC,"
+    f[cnt++] = p;
+    while (*p && cnt < MAX_FIELDS) {
+        if (*p == ',') { *p = '\0'; f[cnt++] = p + 1; }
         p++;
     }
-    return n;
-}
+    if (cnt < 9) return false;
 
-// "4916.45" + 'N' -> +49.27417
-static bool nmea_to_deg(const char *v, char hemi, bool is_lat, float *out) {
-    if (!v || v[0] == '\0') return false;
-    char *end;
-    float raw = strtof(v, &end);
-    if (end == v) return false;
+    n->valid = (f[1][0] == 'A');           // A=valid, V=void
 
-    int deg_digits = is_lat ? 2 : 3;
-    float deg = (float)((int)(raw / 100.0f));
-    float min = raw - deg * 100.0f;
-    float result = deg + min / 60.0f;
+    bool pos_ok = nmea_deg(f[2], f[3][0], true,  &n->lat)
+               && nmea_deg(f[4], f[5][0], false, &n->lon);
 
-    if (hemi == 'S' || hemi == 'W') result = -result;
-    *out = result;
+    float kts, cog;
+    bool spd_ok = nmea_flt(f[6], &kts);
+    bool cog_ok = nmea_flt(f[7], &cog);
+
+    n->lat = pos_ok ? n->lat : 0.0f;
+    n->lon = pos_ok ? n->lon : 0.0f;
+    n->speed_kmh = spd_ok ? kts * 1.852f : 0.0f;
+    n->course    = cog_ok ? cog : 0.0f;
+
     return true;
 }
 
-typedef struct {
-    bool  fix_valid;    // GGA fix quality != 0
-    bool  has_pos;      // lat/lon fields were non-empty and well-formed
-    float lat;          // decimal degrees, +N / -S
-    float lon;          // decimal degrees, +E / -W
-} gps_pos_t;
-
-// Handles GGA and RMC from any talker (GP, GN, GB, GA, GL)
-static bool parse_sentence(char *line, gps_pos_t *pos) {
-    if (!nmea_checksum_ok(line)) return false;
-
-    // sentence ID = chars 3..5 of "$GNGGA,..." (skip talker)
-    char id[4];
-    if (strlen(line) < 6) return false;
-    memcpy(id, line + 3, 3);
-    id[3] = '\0';
-
-    // strip "$xx" prefix so fields start at field 1
-    char *body = line + 3;
-
-    if (strcmp(id, "GGA") == 0) {
-        char *f[MAX_FIELDS];
-        int n = nmea_split(body, f, MAX_FIELDS);
-        // GGA: $xxGGA,time,lat,N,lon,E,fix,sats,hdop,alt,M,..
-        if (n < 6) return false;
-        pos->fix_valid = (f[5][0] != '0' && f[5][0] != '\0');
-        pos->has_pos  = nmea_to_deg(f[1], f[2][0], true,  &pos->lat)
-                     && nmea_to_deg(f[3], f[4][0], false, &pos->lon);
-        return true;
-    }
-    if (strcmp(id, "RMC") == 0) {
-        char *f[MAX_FIELDS];
-        int n = nmea_split(body, f, MAX_FIELDS);
-        // RMC: $xxRMC,time,A/V,lat,N,lon,E,speed,course,date,...
-        if (n < 6) return false;
-        pos->fix_valid = (f[1][0] == 'A');
-        pos->has_pos  = nmea_to_deg(f[2], f[3][0], true,  &pos->lat)
-                     && nmea_to_deg(f[4], f[5][0], false, &pos->lon);
-        return true;
-    }
-    return false; // GSV, GSA, VTG, GLL... ignored for now
-}
-
-
-
+// ---------- main ----------
 int main() {
     stdio_init_all();
 
@@ -109,39 +105,36 @@ int main() {
     gpio_set_function(GPS_RX_PIN, GPIO_FUNC_UART);
     uart_set_format(GPS_UART, 8, 1, UART_PARITY_NONE);
     uart_set_fifo_enabled(GPS_UART, true);
-    uart_set_hw_flow(GPS_UART, false, false);
 
-    while (!stdio_usb_connected()) {
-        sleep_ms(100);
-    }
-    printf("RP2350 GPS parser started (UART0 @ %d baud)\r\n", GPS_BAUD);
+    while (!stdio_usb_connected()) sleep_ms(100);
+    printf("GPS nav parser started\r\n");
 
-    char line[LINE_BUF_LEN];
-    uint16_t idx = 0;
-    gps_pos_t pos = {0};
+    char line[LINE_BUF];
+    int idx = 0;
+    nav_t nav = {0};
 
     while (true) {
         while (uart_is_readable(GPS_UART)) {
             char c = uart_getc(GPS_UART);
 
-            if (c == '$') {            // new sentence: reset buffer
-                idx = 0;
-                line[idx++] = c;
+            if (c == '$') {
+                idx = 0; line[idx++] = c;
             } else if (c == '\r' || c == '\n') {
                 if (idx > 0) {
                     line[idx] = '\0';
-                    if (parse_sentence(line, &pos)) {
-                        if (pos.fix_valid && pos.has_pos)
-                            printf("Lat: %.6f  Lon: %.6f\r\n", pos.lat, pos.lon);
+                    if (parse_rmc(line, &nav)) {
+                        if (nav.valid)
+                            printf("Lat: %9.5f  Lon: %9.5f  Speed: %5.1f km/h  Heading: %5.1f deg\r\n",
+                                   nav.lat, nav.lon, nav.speed_kmh, nav.course);
                         else
-                            printf("Lat: N/A  Lon: N/A\r\n");
+                            printf("No fix  (Speed: N/A  Heading: N/A)\r\n");
                     }
                     idx = 0;
                 }
-            } else if (idx < LINE_BUF_LEN - 1) {
+            } else if (idx < LINE_BUF - 1) {
                 line[idx++] = c;
             } else {
-                idx = 0;  // overflow, drop
+                idx = 0;   // overflow, drop
             }
         }
         tight_loop_contents();
