@@ -60,8 +60,11 @@ static bool nmea_cksum_ok(const char *s) {
 // $GNRMC,time,status,lat,N,lon,E,speed_knots,course_deg,date,...
 typedef struct {
     bool  valid;
+    bool  has_pos;
     float lat, lon;      // decimal degrees
+    bool  has_spd;
     float speed_kmh;     // km/h
+    bool  has_cog;
     float course;        // heading over ground, degrees true
 } nav_t;
 
@@ -79,20 +82,15 @@ static bool parse_rmc(char *line, nav_t *n) {
     }
     if (cnt < 9) return false;
 
-    n->valid = (f[1][0] == 'A');           // A=valid, V=void
-
-    bool pos_ok = nmea_deg(f[2], f[3][0], true,  &n->lat)
-               && nmea_deg(f[4], f[5][0], false, &n->lon);
+    n->valid   = (f[1][0] == 'A');         // A=valid, V=void
+    n->has_pos = nmea_deg(f[2], f[3][0], true,  &n->lat)
+              && nmea_deg(f[4], f[5][0], false, &n->lon);
 
     float kts, cog;
-    bool spd_ok = nmea_flt(f[6], &kts);
-    bool cog_ok = nmea_flt(f[7], &cog);
-
-    n->lat = pos_ok ? n->lat : 0.0f;
-    n->lon = pos_ok ? n->lon : 0.0f;
-    n->speed_kmh = spd_ok ? kts * 1.852f : 0.0f;
-    n->course    = cog_ok ? cog : 0.0f;
-
+    n->has_spd = nmea_flt(f[6], &kts);
+    n->has_cog = nmea_flt(f[7], &cog);
+    n->speed_kmh = kts * 1.852f;
+    n->course    = cog;
     return true;
 }
 
@@ -123,11 +121,20 @@ int main() {
                 if (idx > 0) {
                     line[idx] = '\0';
                     if (parse_rmc(line, &nav)) {
-                        if (nav.valid)
-                            printf("Lat: %9.5f  Lon: %9.5f  Speed: %5.1f km/h  Heading: %5.1f deg\r\n",
-                                   nav.lat, nav.lon, nav.speed_kmh, nav.course);
+                        if (nav.valid && nav.has_pos)
+                            printf("Lat: %9.5f  Lon: %9.5f  ", nav.lat, nav.lon);
                         else
-                            printf("No fix  (Speed: N/A  Heading: N/A)\r\n");
+                            printf("Lat: N/A        Lon: N/A        ");
+
+                        if (nav.valid && nav.has_spd)
+                            printf("Speed: %5.1f km/h  ", nav.speed_kmh);
+                        else
+                            printf("Speed: N/A          ");
+
+                        if (nav.valid && nav.has_cog)
+                            printf("Heading: %5.1f deg\r\n", nav.course);
+                        else
+                            printf("Heading: N/A\r\n");
                     }
                     idx = 0;
                 }
