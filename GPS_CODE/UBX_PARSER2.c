@@ -63,13 +63,15 @@ static bool ubx_rx_byte(uint8_t b)
 {
     switch (st) {
     case S_SYNC1:
-        if (b == SYNC1) st = S_SYNC2;
+        if (b == SYNC1) st = S_SYNC2; // 1 staement needed, hunts sync byte
         break;
     case S_SYNC2:
-        st = (b == SYNC2) ? S_CLS : S_SYNC1;
+        // Equivalent {if (b == SYNC2) st = S_CLS; else st = S_SYNC1;}, 2 statements used to move to next or back
+        st = (b == SYNC2) ? S_CLS : S_SYNC1; // = S_CLS if Sync2 present otherwise Back hunting
         break;
     case S_CLS:
-        frame[0] = b; ck_a = b; ck_b = ck_a;      // checksum starts at class
+        frame[0] = b; 
+        ck_a = b; ck_b = ck_a;      // checksum starts at class
         st = S_ID;
         break;
     case S_ID:
@@ -106,8 +108,7 @@ static bool ubx_rx_byte(uint8_t b)
 // explicit field-by-field decode
 // f points at the first payload byte (iTOW). Offsets match the u-blox spec.
 static void decode_nav_pvt(const uint8_t *f, nav_pvt_t *s) {
-    s->iTOW  = (uint32_t)f[0]        | ((uint32_t)f[1] << 8)
-             | ((uint32_t)f[2] << 16)| ((uint32_t)f[3] << 24);
+    s->iTOW  = (uint32_t)f[0] | ((uint32_t)f[1] << 8) | ((uint32_t)f[2] << 16)| ((uint32_t)f[3] << 24);
 
     s->year  = (uint16_t)f[4] | ((uint16_t)f[5] << 8);
 
@@ -123,11 +124,9 @@ static void decode_nav_pvt(const uint8_t *f, nav_pvt_t *s) {
 
     s->valid = f[11];
 
-    s->tAcc  = (uint32_t)f[12]       | ((uint32_t)f[13] << 8)
-             | ((uint32_t)f[14] << 16)| ((uint32_t)f[15] << 24);
+    s->tAcc  = (uint32_t)f[12] | ((uint32_t)f[13] << 8) | ((uint32_t)f[14] << 16)| ((uint32_t)f[15] << 24);
 
-    s->nano  = (int32_t)((uint32_t)f[16]      | ((uint32_t)f[17] << 8)
-             | ((uint32_t)f[18] << 16)| ((uint32_t)f[19] << 24));
+    s->nano  = (int32_t)((uint32_t)f[16] | ((uint32_t)f[17] << 8) | ((uint32_t)f[18] << 16)| ((uint32_t)f[19] << 24));
 
     s->fixType = f[20];
 
@@ -137,44 +136,31 @@ static void decode_nav_pvt(const uint8_t *f, nav_pvt_t *s) {
 
     s->numSV   = f[23];
 
-    s->lon   = (int32_t)((uint32_t)f[24]      | ((uint32_t)f[25] << 8)
-             | ((uint32_t)f[26] << 16)| ((uint32_t)f[27] << 24));
+    s->lon   = (int32_t)((uint32_t)f[24]   | ((uint32_t)f[25] << 8) | ((uint32_t)f[26] << 16)| ((uint32_t)f[27] << 24));
 
-    s->lat   = (int32_t)((uint32_t)f[28]      | ((uint32_t)f[29] << 8)
-             | ((uint32_t)f[30] << 16)| ((uint32_t)f[31] << 24));
+    s->lat   = (int32_t)((uint32_t)f[28]   | ((uint32_t)f[29] << 8) | ((uint32_t)f[30] << 16) | ((uint32_t)f[31] << 24));
 
-    s->height = (int32_t)((uint32_t)f[32]  | ((uint32_t)f[33] << 8)
-              | ((uint32_t)f[34] << 16)   | ((uint32_t)f[35] << 24));
+    s->height = (int32_t)((uint32_t)f[32]  | ((uint32_t)f[33] << 8)| ((uint32_t)f[34] << 16)   | ((uint32_t)f[35] << 24));
 
-    s->hMSL   = (int32_t)((uint32_t)f[36]  | ((uint32_t)f[37] << 8)
-              | ((uint32_t)f[38] << 16)   | ((uint32_t)f[39] << 24));
+    s->hMSL   = (int32_t)((uint32_t)f[36]  | ((uint32_t)f[37] << 8)| ((uint32_t)f[38] << 16)   | ((uint32_t)f[39] << 24));
 
-    s->hAcc   = (uint32_t)f[40] | ((uint32_t)f[41] << 8)
-              | ((uint32_t)f[42] << 16)   | ((uint32_t)f[43] << 24);
+    s->hAcc   = (uint32_t)f[40] | ((uint32_t)f[41] << 8)| ((uint32_t)f[42] << 16)   | ((uint32_t)f[43] << 24);
 
-    s->vAcc   = (uint32_t)f[44] | ((uint32_t)f[45] << 8)
-              | ((uint32_t)f[46] << 16)   | ((uint32_t)f[47] << 24);
+    s->vAcc   = (uint32_t)f[44] | ((uint32_t)f[45] << 8)| ((uint32_t)f[46] << 16)   | ((uint32_t)f[47] << 24);
 
-    s->velN   = (int32_t)((uint32_t)f[48]  | ((uint32_t)f[49] << 8)
-              | ((uint32_t)f[50] << 16)   | ((uint32_t)f[51] << 24));
+    s->velN   = (int32_t)((uint32_t)f[48]  | ((uint32_t)f[49] << 8) | ((uint32_t)f[50] << 16)   | ((uint32_t)f[51] << 24));
 
-    s->velE   = (int32_t)((uint32_t)f[52]  | ((uint32_t)f[53] << 8)
-              | ((uint32_t)f[54] << 16)   | ((uint32_t)f[55] << 24));
+    s->velE   = (int32_t)((uint32_t)f[52]  | ((uint32_t)f[53] << 8) | ((uint32_t)f[54] << 16)   | ((uint32_t)f[55] << 24));
 
-    s->velD   = (int32_t)((uint32_t)f[56]  | ((uint32_t)f[57] << 8)
-              | ((uint32_t)f[58] << 16)   | ((uint32_t)f[59] << 24));
+    s->velD   = (int32_t)((uint32_t)f[56]  | ((uint32_t)f[57] << 8) | ((uint32_t)f[58] << 16)   | ((uint32_t)f[59] << 24));
 
-    s->gSpeed = (int32_t)((uint32_t)f[60]  | ((uint32_t)f[61] << 8)
-              | ((uint32_t)f[62] << 16)   | ((uint32_t)f[63] << 24));
+    s->gSpeed = (int32_t)((uint32_t)f[60]  | ((uint32_t)f[61] << 8) | ((uint32_t)f[62] << 16)   | ((uint32_t)f[63] << 24));
 
-    s->headMot= (int32_t)((uint32_t)f[64]  | ((uint32_t)f[65] << 8)
-              | ((uint32_t)f[66] << 16)   | ((uint32_t)f[67] << 24));
+    s->headMot= (int32_t)((uint32_t)f[64]  | ((uint32_t)f[65] << 8) | ((uint32_t)f[66] << 16)   | ((uint32_t)f[67] << 24));
 
-    s->sAcc   = (uint32_t)f[68] | ((uint32_t)f[69] << 8)
-              | ((uint32_t)f[70] << 16)   | ((uint32_t)f[71] << 24);
+    s->sAcc   = (uint32_t)f[68] | ((uint32_t)f[69] << 8) | ((uint32_t)f[70] << 16)   | ((uint32_t)f[71] << 24);
 
-    s->headAcc= (uint32_t)f[72] | ((uint32_t)f[73] << 8)
-              | ((uint32_t)f[74] << 16)   | ((uint32_t)f[75] << 24);
+    s->headAcc= (uint32_t)f[72] | ((uint32_t)f[73] << 8) | ((uint32_t)f[74] << 16)   | ((uint32_t)f[75] << 24);
 
     s->pDOP   = (uint16_t)f[76] | ((uint16_t)f[77] << 8);
 
@@ -187,10 +173,8 @@ static void decode_nav_pvt(const uint8_t *f, nav_pvt_t *s) {
 // helpers for integer-only string output 
 static int32_t iabs32(int32_t v) { return v < 0 ? -v : v; }
 
-int main(void)
-{
+int main(void) {
     stdio_init_all();
-
     uart_init(GPS_UART, GPS_BAUD);
     gpio_set_function(GPS_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(GPS_RX_PIN, GPIO_FUNC_UART);
@@ -207,10 +191,11 @@ int main(void)
     while (true) {
         while (uart_is_readable(GPS_UART)) {
             uint8_t b = (uint8_t)uart_getc(GPS_UART);
-            if (!ubx_rx_byte(b)) continue;      // keep feeding until a full valid PVT
+            if (ubx_rx_byte(b) == false) continue;      // keep feeding until a full valid PVT
 
             // checksum passed, class/id/len confirmed -> decode
-            decode_nav_pvt(&frame[4], &pvt);
+            // frame 4 so frame[4] = f[0] in function, this is due to payload being different lenth than message 
+            decode_nav_pvt(&frame[4], &pvt); 
 
             if ((pvt.flags & 0x01) && pvt.fixType >= 2) {
                 // integer decomposition, no floats:
