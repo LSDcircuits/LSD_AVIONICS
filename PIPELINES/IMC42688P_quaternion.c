@@ -14,43 +14,55 @@
 #define PIN_CS    1
 
 //ICM-42688-P registers (bank 0)
-#define REG_DEVICE_CONFIG       0x11  // bit0: soft reset
-#define REG_FIFO_CONFIG         0x16  // 0x40 = stream mode
-#define REG_INT_STATUS          0x2D  // bit2: FIFO threshold, bit1: FIFO full
-#define REG_FIFO_COUNTH         0x2E  // read high first to latch
-#define REG_FIFO_COUNTL         0x2F
-#define REG_FIFO_DATA           0x30  // burst read port
-#define REG_SIGNAL_PATH_RESET   0x4B  // bit1: FIFO flush
-#define REG_PWR_MGMT0           0x4E  // 0x0F = gyro LN + accel LN, temp on
-#define REG_GYRO_CONFIG0        0x4F  // 0x06 = +-2000 dps, 1 kHz ODR
-#define REG_ACCEL_CONFIG0       0x50  // 0x06 = +-16 g, 1 kHz ODR
-#define REG_GYRO_ACCEL_CONFIG0  0x52  // 0x11 = UI filter BW max(400,ODR)/4
+
+// REGISTERS MAPPING
+
+//DEV:
+#define REG_DEVICE_CONFIG       0x11  // bit0: soft reset W
+#define REG_BANK_SEL            0x76  // selects reg bank
+//FIFO:
+#define REG_FIFO_CONFIG         0x16  // 0x40 = stream mode W
 #define REG_FIFO_CONFIG1        0x5F  // 0x47 = resume partial + temp+gyro+accel
 #define REG_FIFO_CONFIG2        0x60  // watermark low byte
 #define REG_FIFO_CONFIG3        0x61  // watermark high nibble
+//INTERRUPT:
 #define REG_INT_CONFIG1         0x64  // 0x00: INT_ASYNC_RESET=0, 100us pulse
 #define REG_INT_SOURCE0         0x65  // 0x04: route FIFO threshold to INT1
+//SENSORS:
+#define REG_GYRO_CONFIG0        0x4F  // 0x06 = +-2000 dps, 1 kHz ODR
+#define REG_ACCEL_CONFIG0       0x50  // 0x06 = +-16 g, 1 kHz ODR
+#define REG_GYRO_ACCEL_CONFIG0  0x52  // 0x11 = UI filter BW max(400,ODR)/4
+//PWR & BUFFER: 
+#define REG_SIGNAL_PATH_RESET   0x4B  // bit1: FIFO flush
+#define REG_PWR_MGMT0           0x4E  // 0x0F = gyro LN + accel LN, temp on
+// READ REGISTERS:
 #define REG_WHO_AM_I            0x75  // expect 0x47
-#define REG_BANK_SEL            0x76
+#define REG_FIFO_COUNTH         0x2E  // read high first to latch #define REG_FIFO_COUNTL 0x2F  
+#define REG_FIFO_DATA           0x30  // burst read port
+#define REG_INT_STATUS          0x2D  // bit2: FIFO threshold, bit1: FIFO full
 
+
+// VALUES USED FOR SCALING & PARSING
+
+// Other:
 #define WHO_AM_I_EXPECTED       0x47
 #define FIFO_WATERMARK_BYTES    64u   // 4 complete 16-byte packets
 #define FIFO_PACKET_SIZE        16u
-
-// Fixed ODR assumption (SPEC): 1 kHz
+#define FIFO_MAX_BURST_SAMPLES  32    // Max samples handled per FIFO burst (static buffers, no malloc)
+// ODR assumption (SPEC): 1 kHz
 #define IMU_ODR_HZ              1000.0f
 #define IMU_DT_S                (1.0f / IMU_ODR_HZ)
-
 // Scaling (SPEC)
 #define GYRO_LSB_PER_DPS        16.4f     // +-2000 dps
 #define ACCEL_LSB_PER_G         2048.0f   // +-16 g
 #define G_TO_MS2                9.80665f
 #define FIFO_TEMP_LSB_PER_C     2.07f
 
-// Max samples handled per FIFO burst (static buffers, no malloc)
-#define FIFO_MAX_BURST_SAMPLES  32
+// Unit conversion
+#define N_PI                    3.14159265358979323846
 
 //Data model (per SPEC) 
+
 typedef struct {
     int16_t  ax, ay, az;
     int16_t  gx, gy, gz;
@@ -62,11 +74,17 @@ typedef struct {
 typedef struct {
     float gx_off, gy_off, gz_off;   // raw LSB offsets
 } imu_cal_t;
-
 static imu_cal_t cal = {0};
 
-// SPI low level
+
+// Batch collecotor
+static imu_nav_sample fifo_batch[32];
+static int fifo_n = 0;
+static int fifo_i = 0;
+
+// SPI HELPER FUNCTION
 static inline void cs_low(void)  { gpio_put(PIN_CS, 0); }
+
 static inline void cs_high(void) { gpio_put(PIN_CS, 1); }
 
 static void reg_write(uint8_t reg, uint8_t val) {
@@ -75,7 +93,6 @@ static void reg_write(uint8_t reg, uint8_t val) {
     spi_write_blocking(IMU_SPI, tx, 2);
     cs_high();
 }
-
 static void reg_read(uint8_t reg, uint8_t *dst, size_t n) {
     uint8_t hdr = (uint8_t)(reg | 0x80);
     cs_low();
@@ -84,7 +101,8 @@ static void reg_read(uint8_t reg, uint8_t *dst, size_t n) {
     cs_high();
 }
 
-// Scaling helpers
+
+// SCALING HELPERS
 static inline float gyro_dps(int16_t raw, float off) {
     return ((float)raw - off) / GYRO_LSB_PER_DPS;
 }
@@ -98,7 +116,8 @@ static inline float fifo_temp_c(int8_t t) {
     return 25.0f + (float)t / FIFO_TEMP_LSB_PER_C;
 }
 
-// (Init / reset / WHOAMI)
+
+// (Init)
 static bool imu_init(void) {
     spi_init(IMU_SPI, 10 * 1000 * 1000);
     spi_set_format(IMU_SPI, 8, true, true, SPI_MSB_FIRST);  // SPI mode 3
@@ -110,21 +129,21 @@ static bool imu_init(void) {
     cs_high();
 
     sleep_ms(5);
-
     // Soft reset, then wait >= 1 ms
     reg_write(REG_DEVICE_CONFIG, 0x01);
     sleep_ms(10);
-
     // Stay in bank 0 (default after reset, but be explicit)
     reg_write(REG_BANK_SEL, 0x00);
-
     uint8_t who = 0;
+
+    // read WHO_AM_I to confirm communication after BANK & CONFIG SELECT
     reg_read(REG_WHO_AM_I, &who, 1);
     printf("WHO_AM_I=0x%02X (expect 0x%02X)\n", who, WHO_AM_I_EXPECTED);
     if (who != WHO_AM_I_EXPECTED) {
         printf("IMU not found. Aborting.\n");
         return false;
     }
+
 
     // Configure everything while sensors are off.
     reg_write(REG_FIFO_CONFIG, 0x40);          // FIFO stream mode
@@ -135,10 +154,10 @@ static bool imu_init(void) {
     reg_write(REG_FIFO_CONFIG2, (uint8_t)(FIFO_WATERMARK_BYTES & 0xFF));
     reg_write(REG_FIFO_CONFIG3, 0x00);         // watermark high nibble = 0
     reg_write(REG_INT_CONFIG1, 0x00);          // 100 us pulse OK at 1 kHz
-    reg_write(REG_INT_SOURCE0, 0x04);          // FIFO threshold -> INT1
+    reg_write(REG_INT_SOURCE0, 0x04);          // FIFO threshold -> INT1 
+
     // INTF_CONFIG0 left at reset default 0x30 (big-endian, byte-count FIFO).
     // TMST_CONFIG left at reset default 0x23 (timestamp on, 1 us resolution).
-
     // Turn on gyro + accel (low noise), temp enabled.
     // After this change from off: no register writes for >= 200 us,
     // then wait for sensor startup.
@@ -152,8 +171,7 @@ static bool imu_init(void) {
 
     // Read-to-clear any pending interrupt status.
     uint8_t dummy;
-    reg_read(REG_INT_STATUS, &dummy, 1);
-
+    reg_read(REG_INT_STATUS, &dummy, 1); // clears flags, stale interrupt
     return true;
 }
 
@@ -161,7 +179,7 @@ static bool imu_init(void) {
 // Returns number of complete parsed samples (0..max_samples).
 // Only complete 16-byte packets are consumed; burst size is capped.
 static int imu_fifo_read(imu_nav_sample *out, int max_samples) {
-    if (!out || max_samples <= 0)
+    if (out == NULL || max_samples <= 0)
         return 0;
 
     static uint8_t buf[FIFO_MAX_BURST_SAMPLES * FIFO_PACKET_SIZE];
@@ -169,20 +187,19 @@ static int imu_fifo_read(imu_nav_sample *out, int max_samples) {
     // Latch FIFO count: read high byte first.
     uint8_t cnt[2];
     reg_read(REG_FIFO_COUNTH, cnt, 2);
-    uint16_t fifo_bytes = (uint16_t)(((uint16_t)cnt[0] << 8) | cnt[1]);
-
-    int packets = (int)(fifo_bytes / FIFO_PACKET_SIZE);
-    if (packets > max_samples)
-        packets = max_samples;
+    uint16_t fifo_bytes = (uint16_t)(((uint16_t)cnt[0] << 8) | cnt[1]); // H << L Returns number of bytes
+    int packets = (int)(fifo_bytes / FIFO_PACKET_SIZE); // get number of packets
+    if (packets > max_samples) 
+        packets = max_samples;  
     if (packets > FIFO_MAX_BURST_SAMPLES)
         packets = FIFO_MAX_BURST_SAMPLES;
     if (packets == 0)
         return 0;
 
-    uint64_t burst_ts = time_us_64();
-    reg_read(REG_FIFO_DATA, buf, (size_t)packets * FIFO_PACKET_SIZE);
+    uint64_t burst_ts = time_us_64(); // take time before read (MCU TIME)
+    reg_read(REG_FIFO_DATA, buf, (size_t)packets * FIFO_PACKET_SIZE); // read
 
-    int n = 0;
+    int n = 0; 
     for (int i = 0; i < packets; i++) {
         const uint8_t *p = &buf[i * FIFO_PACKET_SIZE];
         uint8_t header = p[0];
@@ -210,6 +227,7 @@ static int imu_fifo_read(imu_nav_sample *out, int max_samples) {
 }
 
 // Gyro calibration from FIFO samples
+// this fucntion is used to wrtie to a fifo buffer then unload it into another fucntio with a struct array. 
 static bool calibrate_gyro(uint16_t samples) {
     if (samples == 0)
         return false;
@@ -233,8 +251,8 @@ static bool calibrate_gyro(uint16_t samples) {
             sleep_ms(1);
             continue;
         }
-        for (int i = 0; i < n && got < samples; i++) {
-            if (skipped < discard) {
+        for (int i = 0; i < n && got < samples; i++) { // got = 0 round 1-> then 1,2,3,4 till n_samples
+            if (skipped < discard) { 
                 skipped++;
                 continue;
             }
@@ -244,7 +262,6 @@ static bool calibrate_gyro(uint16_t samples) {
             got++;
         }
     }
-
     cal.gx_off = (float)sum_x / (float)samples;
     cal.gy_off = (float)sum_y / (float)samples;
     cal.gz_off = (float)sum_z / (float)samples;
@@ -252,6 +269,39 @@ static bool calibrate_gyro(uint16_t samples) {
     printf("Gyro offsets: X=%.2f Y=%.2f Z=%.2f LSB\n",
            cal.gx_off, cal.gy_off, cal.gz_off);
     return true;
+}
+
+static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // w, x, y, z
+
+static void integrate_gyro(float gx_rad, float gy_rad, float gz_rad, float dt) {
+
+    float qw = q[0], qx = q[1], qy = q[2], qz = q[3];
+
+    // Quaternion derivative: q_dot = 0.5 * q ⊗ [0, ωx, ωy, ωz]
+    float q_dot_w = 0.5f * (-qx*gx_rad - qy*gy_rad - qz*gz_rad);
+    float q_dot_x = 0.5f * ( qw*gx_rad + qy*gz_rad - qz*gy_rad);
+    float q_dot_y = 0.5f * ( qw*gy_rad - qx*gz_rad + qz*gx_rad);
+    float q_dot_z = 0.5f * ( qw*gz_rad + qx*gy_rad - qy*gx_rad);
+
+    // Integrate
+    q[0] += q_dot_w * dt;
+    q[1] += q_dot_x * dt;
+    q[2] += q_dot_y * dt;
+    q[3] += q_dot_z * dt;
+
+    // Normalize
+    float norm = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+    if (norm > 0.0f) {
+        q[0] /= norm; q[1] /= norm; q[2] /= norm; q[3] /= norm;
+    }
+}
+
+static void quat_to_euler(const float quat[4], float *roll, float *pitch, float *yaw)
+{
+    float w = quat[0], x = quat[1], y = quat[2], z = quat[3];
+    *roll  = atan2f(2.0f*(w*x + y*z), 1.0f - 2.0f*(x*x + y*y));
+    *pitch = asinf(2.0f*(w*y - z*x));
+    *yaw   = atan2f(2.0f*(w*z + x*y), 1.0f - 2.0f*(y*y + z*z));
 }
 
 // Main 
@@ -266,7 +316,7 @@ int main(void) {
     printf("Keep IMU stationary for calibration...\n");
     calibrate_gyro(512);
 
-    imu_nav_sample batch[FIFO_MAX_BURST_SAMPLES];
+    imu_nav_sample batch[FIFO_MAX_BURST_SAMPLES]; // stack of 32 structs 
     uint32_t print_decim = 0;
 
     while (true) {
@@ -278,27 +328,28 @@ int main(void) {
 
         for (int i = 0; i < n; i++) {
             const imu_nav_sample *s = &batch[i];
-
-            float gx_dps = gyro_dps(s->gx, cal.gx_off);
-            float gy_dps = gyro_dps(s->gy, cal.gy_off);
-            float gz_dps = gyro_dps(s->gz, cal.gz_off);
+            float gx_rad = gyro_dps(s->gx, cal.gx_off) * M_PI/180;
+            float gy_rad = gyro_dps(s->gy, cal.gy_off) * M_PI/180;
+            float gz_rad = gyro_dps(s->gz, cal.gz_off) * M_PI/180;
             float ax_g   = accel_g(s->ax);
             float ay_g   = accel_g(s->ay);
             float az_g   = accel_g(s->az);
             float temp_c = fifo_temp_c(s->temp);
-
-            // Decimated print: 1 kHz samples -> ~10 Hz output.
-            if (++print_decim >= 100) {
-                print_decim = 0;
-                printf("G:%7.2f %7.2f %7.2f dps | "
-                       "A:%6.3f %6.3f %6.3f g | "
-                       "T:%5.1f C | "
-                       "STS:%u HostUS:%llu\n",
-                       gx_dps, gy_dps, gz_dps,
+            integrate_gyro(gx_rad, gy_rad, gz_rad, 0.001f);
+            if(i == n - 1){
+                float roll, pitch, yaw;
+                quat_to_euler(q, &roll, &pitch, &yaw);
+                printf("Q:%6.3f %6.3f %6.3f %6.3f\n", q[0],q[1],q[2],q[3]);
+                printf("G:%6.2f %6.2f %6.2f dps | "
+                       "A:%5.3f %5.3f %5.3f g | "
+                       "Q:%6.3f %6.3f %6.3f %6.3f | "
+                       "RPY:%5.1f %5.1f %5.1f deg\n",
+                       gx_rad, gy_rad, gz_rad,
                        ax_g, ay_g, az_g,
-                       temp_c,
-                       s->sensor_ts,
-                       (unsigned long long)s->host_ts_us);
+                       q[0], q[1], q[2], q[3],
+                       roll * 180.0f / M_PI,
+                       pitch * 180.0f / M_PI,
+                       yaw * 180.0f / M_PI);
             }
         }
         sleep_ms(2);
