@@ -1,49 +1,71 @@
 #include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <math.h>
 #include "pico/stdlib.h"
 #include "hardware/spi.h"
 #include "pico/time.h"
 
-// RP2040-Zero <-> LSM6DS3 (4-wire SPI)
+// RP2040 <-> ICM-42688-P (4-wire SPI), pin map from example
 #define IMU_SPI   spi0
 #define PIN_SCK   2
 #define PIN_MOSI  3
 #define PIN_MISO  0
 #define PIN_CS    1
 
-// Scale factors
-#define GYRO_2000DPS_SENS   0.07f
-#define ACC_16G_SENS_G      0.000488f
-#define G_TO_MS2            9.80665f
+//ICM-42688-P registers (bank 0)
+#define REG_DEVICE_CONFIG       0x11  // bit0: soft reset
+#define REG_FIFO_CONFIG         0x16  // 0x40 = stream mode
+#define REG_INT_STATUS          0x2D  // bit2: FIFO threshold, bit1: FIFO full
+#define REG_FIFO_COUNTH         0x2E  // read high first to latch
+#define REG_FIFO_COUNTL         0x2F
+#define REG_FIFO_DATA           0x30  // burst read port
+#define REG_SIGNAL_PATH_RESET   0x4B  // bit1: FIFO flush
+#define REG_PWR_MGMT0           0x4E  // 0x0F = gyro LN + accel LN, temp on
+#define REG_GYRO_CONFIG0        0x4F  // 0x06 = +-2000 dps, 1 kHz ODR
+#define REG_ACCEL_CONFIG0       0x50  // 0x06 = +-16 g, 1 kHz ODR
+#define REG_GYRO_ACCEL_CONFIG0  0x52  // 0x11 = UI filter BW max(400,ODR)/4
+#define REG_FIFO_CONFIG1        0x5F  // 0x47 = resume partial + temp+gyro+accel
+#define REG_FIFO_CONFIG2        0x60  // watermark low byte
+#define REG_FIFO_CONFIG3        0x61  // watermark high nibble
+#define REG_INT_CONFIG1         0x64  // 0x00: INT_ASYNC_RESET=0, 100us pulse
+#define REG_INT_SOURCE0         0x65  // 0x04: route FIFO threshold to INT1
+#define REG_WHO_AM_I            0x75  // expect 0x47
+#define REG_BANK_SEL            0x76
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846f
-#endif
+#define WHO_AM_I_EXPECTED       0x47
+#define FIFO_WATERMARK_BYTES    64u   // 4 complete 16-byte packets
+#define FIFO_PACKET_SIZE        16u
 
-// Register map
-#define WHO_AM_I        0x0F
-#define STATUS_REG      0x1E
-#define OUTX_L_G        0x22
-#define TIMESTAMP0_REG  0x40
-#define CTRL1_XL        0x10
-#define CTRL2_G         0x11
-#define CTRL3_C         0x12
-#define WAKE_UP_DUR     0x5C
-#define FIFO_CTRL5      0x0A
+// Fixed ODR assumption (SPEC): 1 kHz
+#define IMU_ODR_HZ              1000.0f
+#define IMU_DT_S                (1.0f / IMU_ODR_HZ)
 
+// Scaling (SPEC)
+#define GYRO_LSB_PER_DPS        16.4f     // +-2000 dps
+#define ACCEL_LSB_PER_G         2048.0f   // +-16 g
+#define G_TO_MS2                9.80665f
+#define FIFO_TEMP_LSB_PER_C     2.07f
+
+// Max samples handled per FIFO burst (static buffers, no malloc)
+#define FIFO_MAX_BURST_SAMPLES  32
+
+//Data model (per SPEC) 
 typedef struct {
-    int16_t  gx, gy, gz;
     int16_t  ax, ay, az;
-    uint32_t sensor_ts;
-    uint64_t host_ts_us;
+    int16_t  gx, gy, gz;
+    int8_t   temp;
+    uint16_t sensor_ts;   // FIFO ODR timestamp, microseconds, wraps at 65536
+    uint64_t host_ts_us;  // burst timestamp + packet index * 1000 us
 } imu_nav_sample;
 
 typedef struct {
-    float gx_off, gy_off, gz_off;
+    float gx_off, gy_off, gz_off;   // raw LSB offsets
 } imu_cal_t;
 
 static imu_cal_t cal = {0};
 
+// SPI low level
 static inline void cs_low(void)  { gpio_put(PIN_CS, 0); }
 static inline void cs_high(void) { gpio_put(PIN_CS, 1); }
 
@@ -62,73 +84,24 @@ static void reg_read(uint8_t reg, uint8_t *dst, size_t n) {
     cs_high();
 }
 
-// Polled read
-static bool imu_read_polled(imu_nav_sample *s) {
-    uint8_t status;
-    reg_read(STATUS_REG, &status, 1);
-    if ((status & 0x03) != 0x03)
-        return false;
-
-    uint8_t buf[12];
-    reg_read(OUTX_L_G, buf, 12);
-
-    s->gx = (int16_t)(((uint16_t)buf[1]  << 8) | (uint16_t)buf[0]);
-    s->gy = (int16_t)(((uint16_t)buf[3]  << 8) | (uint16_t)buf[2]);
-    s->gz = (int16_t)(((uint16_t)buf[5]  << 8) | (uint16_t)buf[4]);
-    s->ax = (int16_t)(((uint16_t)buf[7]  << 8) | (uint16_t)buf[6]);
-    s->ay = (int16_t)(((uint16_t)buf[9]  << 8) | (uint16_t)buf[8]);
-    s->az = (int16_t)(((uint16_t)buf[11] << 8) | (uint16_t)buf[10]);
-
-    uint8_t ts[3];
-    reg_read(TIMESTAMP0_REG, ts, 3);
-    s->sensor_ts = ((uint32_t)ts[2] << 16) | ((uint32_t)ts[1] << 8) | (uint32_t)ts[0];
-
-    s->host_ts_us = time_us_64();
-    return true;
+// Scaling helpers
+static inline float gyro_dps(int16_t raw, float off) {
+    return ((float)raw - off) / GYRO_LSB_PER_DPS;
+}
+static inline float accel_g(int16_t raw) {
+    return (float)raw / ACCEL_LSB_PER_G;
+}
+static inline float accel_ms2(int16_t raw) {
+    return accel_g(raw) * G_TO_MS2;
+}
+static inline float fifo_temp_c(int8_t t) {
+    return 25.0f + (float)t / FIFO_TEMP_LSB_PER_C;
 }
 
-
-// Pure gyro quaternion integration (no accel, no drift compensation)
-static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // w, x, y, z
-static uint64_t last_attitude_us = 0;
-
-static void integrate_gyro(float gx_rad, float gy_rad, float gz_rad, float dt)
-{
-    float qw = q[0], qx = q[1], qy = q[2], qz = q[3];
-
-    // Quaternion derivative: q_dot = 0.5 * q ⊗ [0, ωx, ωy, ωz]
-    float q_dot_w = 0.5f * (-qx*gx_rad - qy*gy_rad - qz*gz_rad);
-    float q_dot_x = 0.5f * ( qw*gx_rad + qy*gz_rad - qz*gy_rad);
-    float q_dot_y = 0.5f * ( qw*gy_rad - qx*gz_rad + qz*gx_rad);
-    float q_dot_z = 0.5f * ( qw*gz_rad + qx*gy_rad - qy*gx_rad);
-
-    // Integrate
-    q[0] += q_dot_w * dt;
-    q[1] += q_dot_x * dt;
-    q[2] += q_dot_y * dt;
-    q[3] += q_dot_z * dt;
-
-    // Normalize
-    float norm = sqrtf(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-    if (norm > 0.0f) {
-        q[0] /= norm; q[1] /= norm; q[2] /= norm; q[3] /= norm;
-    }
-}
-
-// Convert quaternion to Euler angles (radians)
-static void quat_to_euler(const float quat[4], float *roll, float *pitch, float *yaw)
-{
-    float w = quat[0], x = quat[1], y = quat[2], z = quat[3];
-    *roll  = atan2f(2.0f*(w*x + y*z), 1.0f - 2.0f*(x*x + y*y));
-    *pitch = asinf(2.0f*(w*y - z*x));
-    *yaw   = atan2f(2.0f*(w*z + x*y), 1.0f - 2.0f*(y*y + z*z));
-}
-
-
-// Init
+// (Init / reset / WHOAMI)
 static bool imu_init(void) {
     spi_init(IMU_SPI, 10 * 1000 * 1000);
-    spi_set_format(IMU_SPI, 8, true, true, SPI_MSB_FIRST);
+    spi_set_format(IMU_SPI, 8, true, true, SPI_MSB_FIRST);  // SPI mode 3
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
@@ -138,39 +111,137 @@ static bool imu_init(void) {
 
     sleep_ms(5);
 
+    // Soft reset, then wait >= 1 ms
+    reg_write(REG_DEVICE_CONFIG, 0x01);
+    sleep_ms(10);
+
+    // Stay in bank 0 (default after reset, but be explicit)
+    reg_write(REG_BANK_SEL, 0x00);
+
     uint8_t who = 0;
-    reg_read(WHO_AM_I, &who, 1);
-    printf("WHO_AM_I=0x%02X (expect 0x69)\n", who);
-    if (who != 0x69) {
+    reg_read(REG_WHO_AM_I, &who, 1);
+    printf("WHO_AM_I=0x%02X (expect 0x%02X)\n", who, WHO_AM_I_EXPECTED);
+    if (who != WHO_AM_I_EXPECTED) {
         printf("IMU not found. Aborting.\n");
         return false;
     }
 
-    reg_write(CTRL3_C, 0x44);
-    reg_write(CTRL1_XL, 0x84);
-    reg_write(CTRL2_G, 0x8C);
-    reg_write(WAKE_UP_DUR, 0x01);
-    reg_write(FIFO_CTRL5, 0x00);
-    sleep_ms(5);
+    // Configure everything while sensors are off.
+    reg_write(REG_FIFO_CONFIG, 0x40);          // FIFO stream mode
+    reg_write(REG_GYRO_CONFIG0, 0x06);         // +-2000 dps, 1 kHz
+    reg_write(REG_ACCEL_CONFIG0, 0x06);        // +-16 g, 1 kHz
+    reg_write(REG_GYRO_ACCEL_CONFIG0, 0x11);   // UI filter BW = 250 Hz @ 1 kHz
+    reg_write(REG_FIFO_CONFIG1, 0x47);         // temp+gyro+accel into FIFO
+    reg_write(REG_FIFO_CONFIG2, (uint8_t)(FIFO_WATERMARK_BYTES & 0xFF));
+    reg_write(REG_FIFO_CONFIG3, 0x00);         // watermark high nibble = 0
+    reg_write(REG_INT_CONFIG1, 0x00);          // 100 us pulse OK at 1 kHz
+    reg_write(REG_INT_SOURCE0, 0x04);          // FIFO threshold -> INT1
+    // INTF_CONFIG0 left at reset default 0x30 (big-endian, byte-count FIFO).
+    // TMST_CONFIG left at reset default 0x23 (timestamp on, 1 us resolution).
+
+    // Turn on gyro + accel (low noise), temp enabled.
+    // After this change from off: no register writes for >= 200 us,
+    // then wait for sensor startup.
+    reg_write(REG_PWR_MGMT0, 0x0F);
+    sleep_us(200);
+    sleep_ms(50);
+
+    // Flush FIFO so we start from a clean state.
+    reg_write(REG_SIGNAL_PATH_RESET, 0x02);
+    sleep_ms(1);
+
+    // Read-to-clear any pending interrupt status.
+    uint8_t dummy;
+    reg_read(REG_INT_STATUS, &dummy, 1);
+
     return true;
 }
 
+// FIFO burst read
+// Returns number of complete parsed samples (0..max_samples).
+// Only complete 16-byte packets are consumed; burst size is capped.
+static int imu_fifo_read(imu_nav_sample *out, int max_samples) {
+    if (!out || max_samples <= 0)
+        return 0;
 
-// Calibration
+    static uint8_t buf[FIFO_MAX_BURST_SAMPLES * FIFO_PACKET_SIZE];
+
+    // Latch FIFO count: read high byte first.
+    uint8_t cnt[2];
+    reg_read(REG_FIFO_COUNTH, cnt, 2);
+    uint16_t fifo_bytes = (uint16_t)(((uint16_t)cnt[0] << 8) | cnt[1]);
+
+    int packets = (int)(fifo_bytes / FIFO_PACKET_SIZE);
+    if (packets > max_samples)
+        packets = max_samples;
+    if (packets > FIFO_MAX_BURST_SAMPLES)
+        packets = FIFO_MAX_BURST_SAMPLES;
+    if (packets == 0)
+        return 0;
+
+    uint64_t burst_ts = time_us_64();
+    reg_read(REG_FIFO_DATA, buf, (size_t)packets * FIFO_PACKET_SIZE);
+
+    int n = 0;
+    for (int i = 0; i < packets; i++) {
+        const uint8_t *p = &buf[i * FIFO_PACKET_SIZE];
+        uint8_t header = p[0];
+
+        // Valid simple sample: HEADER_MSG=0, HEADER_ACCEL=1, HEADER_GYRO=1.
+        // Hi-res/FSYNC/ODR-change flags ignored in this simple version.
+        if ((header & 0x80) != 0)
+            continue;
+        if ((header & 0x60) != 0x60)
+            continue;
+
+        imu_nav_sample *s = &out[n];
+        s->ax = (int16_t)(((uint16_t)p[1]  << 8) | p[2]);
+        s->ay = (int16_t)(((uint16_t)p[3]  << 8) | p[4]);
+        s->az = (int16_t)(((uint16_t)p[5]  << 8) | p[6]);
+        s->gx = (int16_t)(((uint16_t)p[7]  << 8) | p[8]);
+        s->gy = (int16_t)(((uint16_t)p[9]  << 8) | p[10]);
+        s->gz = (int16_t)(((uint16_t)p[11] << 8) | p[12]);
+        s->temp = (int8_t)p[13];
+        s->sensor_ts = (uint16_t)(((uint16_t)p[14] << 8) | p[15]);
+        s->host_ts_us = burst_ts + (uint64_t)i * 1000u;  // preserve 1 kHz packet spacing
+        n++;
+    }
+    return n;
+}
+
+// Gyro calibration from FIFO samples
 static bool calibrate_gyro(uint16_t samples) {
+    if (samples == 0)
+        return false;
+
+    const uint16_t discard = 100;
     int32_t sum_x = 0, sum_y = 0, sum_z = 0;
-    uint16_t discard = 100;
+    uint16_t got = 0, skipped = 0;
 
     printf("CAL: keep board perfectly still...\n");
     sleep_ms(500);
 
-    for (uint16_t i = 0; i < samples + discard; ) {
-        imu_nav_sample s;
-        if (imu_read_polled(&s)) {
-            if (i >= discard) {
-                sum_x += s.gx; sum_y += s.gy; sum_z += s.gz;
+    // Flush stale FIFO data before collecting.
+    reg_write(REG_SIGNAL_PATH_RESET, 0x02);
+    sleep_ms(2);
+
+    imu_nav_sample batch[FIFO_MAX_BURST_SAMPLES];
+
+    while (got < samples) {
+        int n = imu_fifo_read(batch, FIFO_MAX_BURST_SAMPLES);
+        if (n <= 0) {
+            sleep_ms(1);
+            continue;
+        }
+        for (int i = 0; i < n && got < samples; i++) {
+            if (skipped < discard) {
+                skipped++;
+                continue;
             }
-            i++;
+            sum_x += batch[i].gx;
+            sum_y += batch[i].gy;
+            sum_z += batch[i].gz;
+            got++;
         }
     }
 
@@ -183,8 +254,7 @@ static bool calibrate_gyro(uint16_t samples) {
     return true;
 }
 
-
-// Main
+// Main 
 int main(void) {
     stdio_init_all();
     sleep_ms(200);
@@ -194,66 +264,44 @@ int main(void) {
     }
 
     printf("Keep IMU stationary for calibration...\n");
-    sleep_ms(500);
     calibrate_gyro(512);
 
-    imu_nav_sample s;
+    imu_nav_sample batch[FIFO_MAX_BURST_SAMPLES];
     uint32_t print_decim = 0;
-    uint32_t prev_sensor_ts = 0;
-    bool have_prev = false;
 
     while (true) {
-        if (imu_read_polled(&s)) {
-            // Scale to physical units
-            float gx_dps = (s.gx - cal.gx_off) * GYRO_2000DPS_SENS * -1.0f;
-            float gy_dps = (s.gy - cal.gy_off) * GYRO_2000DPS_SENS;
-            float gz_dps = (s.gz - cal.gz_off) * GYRO_2000DPS_SENS * -1.0f;
+        int n = imu_fifo_read(batch, FIFO_MAX_BURST_SAMPLES);
+        if (n <= 0) {
+            sleep_ms(1);
+            continue;
+        }
 
-            float ax_g = s.ax * ACC_16G_SENS_G;
-            float ay_g = s.ay * ACC_16G_SENS_G;
-            float az_g = s.az * ACC_16G_SENS_G;
+        for (int i = 0; i < n; i++) {
+            const imu_nav_sample *s = &batch[i];
 
-            // --- Attitude update (gyro-only) ---
-            float dt;
-            if (last_attitude_us == 0) {
-                dt = 1.0f / 1660.0f;  // first sample fallback
-            } else {
-                dt = (float)(s.host_ts_us - last_attitude_us) * 1e-6f;
-                if (dt <= 0.0f || dt > 0.01f) dt = 1.0f / 1660.0f;
-            }
-            last_attitude_us = s.host_ts_us;
+            float gx_dps = gyro_dps(s->gx, cal.gx_off);
+            float gy_dps = gyro_dps(s->gy, cal.gy_off);
+            float gz_dps = gyro_dps(s->gz, cal.gz_off);
+            float ax_g   = accel_g(s->ax);
+            float ay_g   = accel_g(s->ay);
+            float az_g   = accel_g(s->az);
+            float temp_c = fifo_temp_c(s->temp);
 
-            float gx_rad = gx_dps * (M_PI / 180.0f);
-            float gy_rad = gy_dps * (M_PI / 180.0f);
-            float gz_rad = gz_dps * (M_PI / 180.0f);
-
-            integrate_gyro(gx_rad, gy_rad, gz_rad, dt);
-
-            // --- Debug print ---
-            uint32_t dt_ticks = have_prev ? ((s.sensor_ts - prev_sensor_ts) & 0xFFFFFFu) : 0;
-            prev_sensor_ts = s.sensor_ts;
-            have_prev = true;
-
+            // Decimated print: 1 kHz samples -> ~10 Hz output.
             if (++print_decim >= 100) {
                 print_decim = 0;
-                float roll, pitch, yaw;
-                quat_to_euler(q, &roll, &pitch, &yaw);
-
-                printf("G:%6.2f %6.2f %6.2f dps | "
-                       "A:%5.3f %5.3f %5.3f g | "
-                       "Q:%6.3f %6.3f %6.3f %6.3f | "
-                       "RPY:%5.1f %5.1f %5.1f deg | "
-                       "HostUS:%llu\n",
+                printf("G:%7.2f %7.2f %7.2f dps | "
+                       "A:%6.3f %6.3f %6.3f g | "
+                       "T:%5.1f C | "
+                       "STS:%u HostUS:%llu\n",
                        gx_dps, gy_dps, gz_dps,
                        ax_g, ay_g, az_g,
-                       q[0], q[1], q[2], q[3],
-                       roll * 180.0f / M_PI,
-                       pitch * 180.0f / M_PI,
-                       yaw * 180.0f / M_PI,
-                       s.host_ts_us);
-                sleep_ms(10);
+                       temp_c,
+                       s->sensor_ts,
+                       (unsigned long long)s->host_ts_us);
             }
         }
+        sleep_ms(2);
     }
     return 0;
 }
