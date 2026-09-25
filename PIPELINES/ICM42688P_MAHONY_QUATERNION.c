@@ -228,6 +228,7 @@ static int imu_fifo_read(imu_nav_sample *out, int max_samples) {
 
 // Gyro calibration from FIFO samples
 // this fucntion is used to wrtie to a fifo buffer then unload it into another fucntio with a struct array. 
+// this might not be needed due to mahony bias | check the performance difference. 
 static bool calibrate_gyro(uint16_t samples) {
     if (samples == 0)
         return false;
@@ -285,6 +286,9 @@ static void mahony_update(float gx_rad, float gy_rad, float gz_rad, float ax_g, 
     float ex = 0.0f, ey = 0.0f, ez = 0.0f;
 
     // Normalize accelerometer (only correct attitude when not in freefall)
+    // Extra note: for different conditions it can be wrong, in stable flight norm = 1, in turn norm > 1 
+    // need to make a tunable funciton which takes norm and adjusts KP & KI to give gyro priority during turns & freefall
+    // then give the Acc more priority during level flight so it constanty uses the correct conditions for bias & G reference
     norm = sqrtf(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
     if (norm > 0.1f) {
         ax_g /= norm; ay_g /= norm; az_g /= norm;
