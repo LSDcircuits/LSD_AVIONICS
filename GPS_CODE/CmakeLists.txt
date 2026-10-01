@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.13)
+set(PICO_BOARD pico2)
+set(PICO_PLATFORM rp2350-arm-s)
+include(pico_sdk_import.cmake)
+project(M9N_parser C CXX ASM)
+set(CMAKE_C_STANDARD 11)
+pico_sdk_init()
+
+add_executable(M9N_parser  M9N_parser.c)
+
+pico_enable_stdio_usb(M9N_parser 1)
+pico_enable_stdio_uart(M9N_parser 0)   # keep Pico UART free for the GPS
+
+target_link_libraries(M9N_parser pico_stdlib hardware_uart)
+
+pico_add_extra_outputs(M9N_parser)
+
