@@ -1,0 +1,194 @@
+# Offline Map Pipeline — Dominican Republic Base Map
+### LSD_Avionics ground-station map, from raw data to PySide6 — BY Lorenzo Daidone - MIT
+
+**End product:** `domrep_raster.mbtiles` — a raster MBTiles file (SQLite, PNG tiles,
+zooms 0–14) of the Dominican Republic that renders fully offline in the PySide6
+viewer (`MBTILES_MAP_VIEWER.py`). No internet, no web engine, no QGIS at runtime.
+
+---
+
+## 1 — Where every piece of data comes from
+
+| Item | Source | License | What it is |
+|---|---|---|---|
+| Map data (roads, cities, boundaries, water) | **OpenStreetMap** — raw data | **ODbL** — attribution *"© OpenStreetMap contributors"* required | The geographic database everything below is derived from |
+| Ready-made extract (path A, what we used) | **extract.bbbike.org** | OSM data under ODbL; style © systemed/BBBike | Server-rendered **vector** MBTiles for any box you draw, emailed to you in minutes |
+| Country/region extract (path B, full control) | **Geofabrik** — geofabrik.de | ODbL | Weekly-updated `.osm.pbf` raw dumps per country/region |
+| Map style (colors, label hierarchy) | **OSM Liberty** — github.com/maputnik/osm-liberty | Free (MIT-style), keep credit | MapBox GL style JSON matching the OpenMapTiles schema |
+| QGIS | qgis.org | GPL v2 | The "oven": styles the data and bakes the raster tiles |
+| osmium-tool | `brew install osmium-tool` | GPL | Fast command-line filter/crop for `.osm.pbf` files |
+| PySide6 | `pip install PySide6` | LGPL | The offline viewer at runtime |
+
+**Key format fact (learned the hard way):** BBBike's MBTiles is **vector**
+(`format=pbf` in its metadata) — geometry, not pictures. The PySide viewer needs
+**raster** (`format=png`). QGIS is the converter in between.
+
+---
+
+## 2 — Software to install (macOS)
+
+```bash
+brew install osmium-tool        # optional but recommended (crop + places extract)
+pip3 install PySide6            # viewer
+```
+QGIS: download the macOS build from https://qgis.org (free).
+
+---
+
+## 3 — Procedure A: BBBike quick path (what we actually did)
+
+### 3.1 Get the vector MBTiles
+1. Go to **https://extract.bbbike.org**
+2. Pan to the Dominican Republic, click the rectangle tool, draw a box over the
+   whole country (or just your flying area — smaller = everything faster)
+3. **Format → MBTiles**, give it a name ("DOMREP"), enter your email
+4. Wait for the email (minutes), download the zip
+
+Contents: `*.mbtiles` (the data), README, logfile, checksum.
+
+**Verify what you got** (do this every time — it decides what happens next):
+```bash
+sqlite3 planet_<coords>.mbtiles "SELECT value FROM metadata WHERE name='format';"
+```
+- `pbf` → **vector** tiles. Continue below (QGIS conversion needed).
+- `png`/`jpg` → already raster — skip to section 5, the viewer opens it directly.
+
+### 3.2 Load and style in QGIS
+1. Drag the `.mbtiles` into QGIS → it loads as a **vector tile** layer
+   (grid icon in the Layers panel)
+2. Get the style: open https://github.com/maputnik/osm-liberty → `style.json` →
+   **Raw** → save as `osm-liberty.json`
+3. Right-click the layer → **Properties → Symbology → Style → Load Style…** →
+   file filter *MapBox GL Style JSON* → pick `osm-liberty.json` → OK
+   - Expected: colors + roads + water appear
+   - **Known macOS issue:** text labels from GL styles may not render at all
+     (font/`name_en` attribute mismatch). If labels are missing, do NOT debug it —
+     use the native-labels step 3.4, which is what we shipped.
+
+### 3.3 Extract the places layer (terminal)
+From the Geofabrik country file (or re-download it from geofabrik.de if you
+don't have it — Central America section):
+```bash
+osmium tags-filter haiti-and-domrep-261003.osm.pbf n/place -o places.osm.pbf
+```
+`n/place` = all nodes carrying a `place` tag (cities, towns, villages,
+provinces). Output is a few thousand points — loads instantly.
+
+### 3.4 Labels and city dots (native QGIS — this cannot silently fail)
+1. Drag `places.osm.pbf` in → **points** layer only
+2. **Look at the attribute table first** (right-click → Attribute Table): the OSM
+   importer promotes some tags to real columns. In our file `place` was its own
+   column while `name` stayed inside `other_tags` — the expressions below assume
+   that; adjust after looking.
+3. **Symbology** tab → top dropdown **Rule-based** → double-click the rule →
+   **Filter**:
+   ```
+   "place" IN ('city','town','province','state')
+   ```
+   → symbol: circle, size 2, stroke width 0 → OK. (Villages now draw nothing.)
+4. **Labels** tab → **Single Labels** → **Value** → ε button →
+   ```
+   IF("place" IN ('city','town','province','state'), "name", '')
+   ```
+   → font `Helvetica`, size 10 → **Buffer**: enable, white, 1 mm (readability
+   over roads — non-negotiable)
+5. Hierarchy with data-defined overrides (optional): Size → ε →
+   `CASE WHEN "place"='city' THEN 14 WHEN "place" IN ('province','state') THEN 13 ELSE 10 END`
+   Style → ε →
+   `CASE WHEN "place" IN ('city','province','state') THEN 'Bold' ELSE 'Regular' END`
+6. **Project CRS** (bottom-right status bar): set **EPSG:3857**
+
+### 3.5 Bake the raster MBTiles
+**Processing Toolbox → Raster tools → Generate XYZ tiles (MBTiles)**
+| Parameter | Value |
+|---|---|
+| Extent | "…" → Draw on map canvas → box around the DR |
+| Min zoom | 0 |
+| Max zoom | 14 (never above the source's max — BBBike gave z14) |
+| Tile format | **PNG** (JPEG blurs baked text) |
+| Output | `domrep_raster.mbtiles` |
+
+Country-wide ≈ 30k tiles, minutes of rendering, a few hundred MB. Whatever is
+checked/visible in the canvas is what gets baked.
+
+### 3.6 Verify
+- Drag the output back into QGIS → appears as a **raster** layer, renders
+  identically, works offline
+- `sqlite3 domrep_raster.mbtiles "SELECT value FROM metadata WHERE name='format';"` → `png`
+- **File → Save** the QGIS project as `DR_MAP.qgz` — the styling session is the
+  real asset; the `.mbtiles` is a disposable re-runnable artifact.
+
+---
+
+## 4 — Procedure B: Geofabrik PBF, full manual styling (for later)
+
+Use when you want your own aviation look (runways emphasized, muted roads).
+1. Download `*.osm.pbf` from **geofabrik.de** (weekly updates)
+2. Optional crop (makes everything faster):
+   ```bash
+   osmium extract -b "-70.2,18.0,-69.4,18.9" --strategy=complete_ways      haiti-and-domrep-261003.osm.pbf -o dr_crop.osm.pbf
+   ```
+   (bbox = min_lon,min_lat,max_lon,max_lat from bboxfinder.com. **Quote it** —
+   a leading `-` in the bbox gets eaten as a flag otherwise.)
+3. QGIS: drag in → layers appear as **points / lines / multilinestrings /
+   other_relations**, tags packed in `other_tags` as `"key"=>"value"` pairs
+   (filter with `map_get(hstore_to_map("other_tags"),'key')` after checking the
+   attribute table)
+4. First load of a whole-country file takes 5–15 min; immediately **export to
+   GeoPackage** (right-click layer → Export) and work from that afterwards
+5. Style, set CRS 3857, Generate XYZ tiles — identical to 3.5/3.6
+
+---
+
+## 5 — PySide6 viewer
+
+```bash
+python3 MBTILES_MAP_VIEWER.py
+```
+**Open Map…** → pick `domrep_raster.mbtiles`. Drag = pan, wheel = zoom toward
+cursor, Home = recenter. Red crosshair at view center, status bar shows
+cursor lat/lon + zoom.
+
+Reader essentials (implemented in the viewer):
+- SQLite opened **read-only**: `file:<path>?mode=ro`
+- Slippy math: world at zoom z = 256·2^z pixels; lon/lat ↔ pixels via standard
+  formulas
+- **TMS y-flip on every query**: `tile_row = 2^z − 1 − y`
+- One worker `QThread` + LRU pixmap cache; tiles paint in `drawBackground()`
+
+---
+
+## 6 — Troubleshooting log (everything we hit, so you don't rediscover it)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Viewer shows nothing / `format: pbf` | BBBike MBTiles is **vector**, viewer needs raster | Convert via QGIS (3.5) |
+| `wrong format for coordinate '=-70.2'` | `-b=-70...` parsed wrong | `-b "-70.2,..."` (quote, no `=`) |
+| PBF takes forever to load | Whole-country file, index built on open | osmium crop first, or export to GeoPackage |
+| "asks for ID", drawn polygon vanishes | Attribute form closed with X = feature discarded | Press **OK** on the form; or use Processing → Extract by extent (no drawing) |
+| GL style loads, colors ok, **zero labels** (macOS) | QGIS font/`name_en` mismatch, fails silently | Use native labels on a places layer (3.4) — shipped solution |
+| `map_get(...,'place')` → all labels vanish | `place` is a real column, not in `other_tags` | Open attribute table; use `"place"` column directly |
+| Blank/empty export | Online XYZ layers checked (OSM tile policy forbids re-export) or wrong extent | Only your two layers checked; extent over DR |
+| Blurry labels in baked tiles | Project in EPSG:4326, or JPEG tiles | Project → 3857; tile format PNG |
+| Tiles look correct but offset/shifted | Forgetting the TMS y-flip | `tile_row = 2^z − 1 − y` in the SQL |
+
+---
+
+## 7 — Keeping the map fresh
+
+- OSM data updates continuously; Geofabrik/BBBike refresh ~weekly
+- Redo = repeat 3.1 (or download new Geofabrik file) → re-run 3.5 → **swap the
+  file**. The viewer code never changes.
+- Suggested cadence: re-bake monthly or before any long flying period; the DR
+  road network doesn't churn, but new subdivisions and road reclassifications do
+  appear.
+- Keep `DR_MAP.qgz` in version control alongside this document — it *is* the map.
+
+---
+
+## 8 — License obligations (short version)
+
+- Map data: **ODbL** — display "© OpenStreetMap contributors" in the app/about box
+- OSM Liberty style: keep its credit line if you restyle from it
+- Personal/experimental avionics use is fine; if the app is ever distributed,
+  keep attribution and link osm.org/copyright
