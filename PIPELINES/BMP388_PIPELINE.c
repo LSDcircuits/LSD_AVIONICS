@@ -5,27 +5,27 @@
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 
-#define BMP_ADDR      0x76   // SDO low; use 0x77 if SDO tied high
+#define BMP_ADDR      0x76
 #define REG_CHIP_ID   0x00
-#define REG_DATA      0x04   // 6 bytes: press[3], temp[3]
+#define REG_DATA      0x04
 #define REG_PWR_CTRL  0x1B
 #define REG_OSR       0x1C
-#define REG_CALIB     0x31   // 21 bytes of NVM calibration
+#define REG_CALIB     0x31
 
 typedef struct {
-    float T1, T2, T3;
-    float P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11;
-    float t_lin;
+    double T1, T2, T3;
+    double P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11;
+    double t_lin;
 } bmp_calib_t;
 
 static void bmp_rd(uint8_t reg, uint8_t *buf, size_t n) {
-    i2c_write_blocking(i2c0, BMP_ADDR, &reg, 1, true);
-    i2c_read_blocking(i2c0, BMP_ADDR, buf, n, false);
+    i2c_write_blocking(i2c1, BMP_ADDR, &reg, 1, true);
+    i2c_read_blocking(i2c1, BMP_ADDR, buf, n, false);
 }
 
 static void bmp_wr(uint8_t reg, uint8_t val) {
     uint8_t buf[2] = {reg, val};
-    i2c_write_blocking(i2c0, BMP_ADDR, buf, 2, false);
+    i2c_write_blocking(i2c1, BMP_ADDR, buf, 2, false);
 }
 
 static bool bmp_init(bmp_calib_t *c) {
@@ -36,56 +36,57 @@ static bool bmp_init(bmp_calib_t *c) {
     uint8_t nvm[21];
     bmp_rd(REG_CALIB, nvm, 21);
 
-    uint16_t u16;
-    int16_t  s16;
-    u16 = (nvm[0]  << 8) | nvm[1];  c->T1  = (float)u16 * 256.0f;
-    u16 = (nvm[2]  << 8) | nvm[3];  c->T2  = (float)u16 * 131072.0f;
-    c->T3  = (float)(int8_t)nvm[4];
-    s16 = (nvm[5]  << 8) | nvm[6];  c->P1  = (float)s16;
-    s16 = (nvm[7]  << 8) | nvm[8];  c->P2  = (float)s16;
-    c->P3  = (float)(int8_t)nvm[9];
-    c->P4  = (float)(int8_t)nvm[10];
-    u16 = (nvm[11] << 8) | nvm[12]; c->P5  = (float)u16 * 16.0f;
-    u16 = (nvm[13] << 8) | nvm[14]; c->P6  = (float)u16 * 16.0f;
-    c->P7  = (float)(int8_t)nvm[15];
-    c->P8  = (float)(int8_t)nvm[16];
-    s16 = (nvm[17] << 8) | nvm[18]; c->P9  = (float)s16;
-    c->P10 = (float)(int8_t)nvm[19];
-    c->P11 = (float)(int8_t)nvm[20];
+    // Datasheet 9.1: NVM -> PAR_* (16-bit values: LOW byte at lower address)
+    c->T1  = (double)((nvm[1]  << 8) | nvm[0])  * 256.0;                          // /2^-8
+    c->T2  = (double)((nvm[3]  << 8) | nvm[2])  / 1073741824.0;                   // /2^30
+    c->T3  = (double)(int8_t)nvm[4]              / 281474976710656.0;             // /2^48
+    c->P1  = ((double)(int16_t)((nvm[6]  << 8) | nvm[5])  - 16384.0) / 1048576.0; // (NVM-2^14)/2^20
+    c->P2  = ((double)(int16_t)((nvm[8]  << 8) | nvm[7])  - 16384.0) / 536870912.0;// (NVM-2^14)/2^29
+    c->P3  = (double)(int8_t)nvm[9]              / 4294967296.0;                  // /2^32
+    c->P4  = (double)(int8_t)nvm[10]             / 137438953472.0;                // /2^37
+    c->P5  = (double)((nvm[12] << 8) | nvm[11]) * 8.0;                            // /2^-3
+    c->P6  = (double)((nvm[14] << 8) | nvm[13]) / 64.0;                           // /2^6
+    c->P7  = (double)(int8_t)nvm[15]             / 256.0;                         // /2^8
+    c->P8  = (double)(int8_t)nvm[16]             / 32768.0;                       // /2^15
+    c->P9  = (double)(int16_t)((nvm[18] << 8) | nvm[17]) / 281474976710656.0;     // /2^48
+    c->P10 = (double)(int8_t)nvm[19]             / 281474976710656.0;             // /2^48
+    c->P11 = (double)(int8_t)nvm[20]             / 36893488147419103232.0;        // /2^65
 
-    bmp_wr(REG_OSR, 0x00);       // no oversampling
-    bmp_wr(REG_PWR_CTRL, 0x33);  // press+temp enabled, normal mode
+    bmp_wr(REG_OSR, 0x00);
+    bmp_wr(REG_PWR_CTRL, 0x33);
     return true;
 }
 
-static void bmp_read(bmp_calib_t *c, float *temp_c, float *press_pa) {
+static void bmp_read(bmp_calib_t *c, double *temp_c, double *press_pa) {
     uint8_t d[6];
     bmp_rd(REG_DATA, d, 6);
     uint32_t up = ((uint32_t)d[2] << 16) | (d[1] << 8) | d[0];
     uint32_t ut = ((uint32_t)d[5] << 16) | (d[4] << 8) | d[3];
 
-    // Temperature (Bosch float compensation)
-    float t = ((float)ut - c->T1) * (c->T2 / 131072.0f);
-    c->t_lin = t;
-    *temp_c = t + c->T3 / 16.0f;
+    // Datasheet 9.2 Temperature
+    double pd1  = (double)ut - c->T1;
+    double t_lin = pd1 * c->T2 + pd1 * pd1 * c->T3;
+    c->t_lin = t_lin;
+    *temp_c = t_lin;
 
-    // Pressure
-    float o1 = c->P5 + c->P6 * t + c->P7 * t * t + c->P8 * t * t * t;
-    float o2 = (float)up * (c->P1 + c->P2 * t + c->P3 * t * t + c->P4 * t * t * t);
-    float up2 = (float)up * (float)up;
-    float o4 = up2 * (c->P9 + c->P10 * t) + up2 * (float)up * c->P11;
+    // Datasheet 9.3 Pressure
+    double t2 = t_lin * t_lin, t3 = t2 * t_lin;
+    double o1 = c->P5 + c->P6*t_lin + c->P7*t2 + c->P8*t3;
+    double o2 = (double)up * (c->P1 + c->P2*t_lin + c->P3*t2 + c->P4*t3);
+    double up2 = (double)up * up;
+    double o4 = up2 * (c->P9 + c->P10*t_lin) + up2 * (double)up * c->P11;
     *press_pa = o1 + o2 + o4;
 }
 
 int main() {
     stdio_init_all();
-    sleep_ms(2000); // let USB serial attach
+    sleep_ms(2000);
 
-    i2c_init(i2c0, 400 * 1000);
-    gpio_set_function(4, GPIO_FUNC_I2C); // SDA
-    gpio_set_function(5, GPIO_FUNC_I2C); // SCL
-    gpio_pull_up(4);
-    gpio_pull_up(5);
+    i2c_init(i2c1, 400 * 1000);
+    gpio_set_function(26, GPIO_FUNC_I2C);
+    gpio_set_function(27, GPIO_FUNC_I2C);
+    gpio_pull_up(26);
+    gpio_pull_up(27);
 
     static bmp_calib_t cal;
     if (!bmp_init(&cal)) {
@@ -94,9 +95,9 @@ int main() {
     }
 
     while (1) {
-        float t, p;
+        double t, p;
         bmp_read(&cal, &t, &p);
-        float alt = 44330.0f * (1.0f - powf(p / 101325.0f, 0.1903f));
+        double alt = 44330.0 * (1.0 - pow(p / 101325.0, 0.1903));
         printf("T: %.2f C  P: %.1f Pa  alt: %.1f m\n", t, p, alt);
         sleep_ms(500);
     }
