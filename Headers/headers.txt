@@ -1,0 +1,8 @@
+This directory is dedicated to store headers for better code hygene:
+
+headers:
+
+bmp388.h
+m9n_ubx.h
+icm42688p.h
+
