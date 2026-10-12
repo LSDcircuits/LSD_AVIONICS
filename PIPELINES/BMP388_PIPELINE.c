@@ -10,7 +10,10 @@
 #define REG_DATA      0x04
 #define REG_PWR_CTRL  0x1B
 #define REG_OSR       0x1C
+#define REG_ODR       0x1D
 #define REG_CALIB     0x31
+
+// memory layout
 
 typedef struct {
     double T1, T2, T3;
@@ -18,6 +21,15 @@ typedef struct {
     double t_lin;
 } bmp_calib_t;
 
+// static keep calibration in this file call 
+static bmp_calib_t g_cal;
+
+typedef struct {
+    double temp;
+    double press;
+} pt_t;
+
+// non static, struct values used outof this file
 static void bmp_rd(uint8_t reg, uint8_t *buf, size_t n) {
     i2c_write_blocking(i2c1, BMP_ADDR, &reg, 1, true);
     i2c_read_blocking(i2c1, BMP_ADDR, buf, n, false);
@@ -52,7 +64,8 @@ static bool bmp_init(bmp_calib_t *c) {
     c->P10 = (double)(int8_t)nvm[19]             / 281474976710656.0;             // /2^48
     c->P11 = (double)(int8_t)nvm[20]             / 36893488147419103232.0;        // /2^65
 
-    bmp_wr(REG_OSR, 0x00);
+    bmp_wr(REG_OSR, 0x2D);
+    bmp_wr(REG_ODR, 0x05);
     bmp_wr(REG_PWR_CTRL, 0x33);
     return true;
 }
@@ -78,27 +91,27 @@ static void bmp_read(bmp_calib_t *c, double *temp_c, double *press_pa) {
     *press_pa = o1 + o2 + o4;
 }
 
+void get_pt(pt_t *out){
+    double t, p;
+    bmp_read(&g_cal, &t, &p);
+    out->temp  = (double)t;
+    out->press = (double)p;
+}
+
 int main() {
     stdio_init_all();
     sleep_ms(2000);
-
     i2c_init(i2c1, 400 * 1000);
     gpio_set_function(26, GPIO_FUNC_I2C);
     gpio_set_function(27, GPIO_FUNC_I2C);
     gpio_pull_up(26);
     gpio_pull_up(27);
-
-    static bmp_calib_t cal;
-    if (!bmp_init(&cal)) {
-        printf("BMP388 not found!\n");
-        while (1) tight_loop_contents();
-    }
+    bmp_init(&g_cal);
+    pt_t out;
 
     while (1) {
-        double t, p;
-        bmp_read(&cal, &t, &p);
-        double alt = 44330.0 * (1.0 - pow(p / 101325.0, 0.1903));
-        printf("T: %.2f C  P: %.1f Pa  alt: %.1f m\n", t, p, alt);
-        sleep_ms(500);
+        get_pt(&out);
+        printf("temp :%6.3f\n"
+        "press: %6.3f\n", out.temp, out.press);
     }
 }
