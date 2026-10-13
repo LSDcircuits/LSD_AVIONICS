@@ -30,7 +30,6 @@
 #define REG_FIFO_DATA           0x30  
 #define REG_INT_STATUS          0x2D  
 
-
 #define WHO_AM_I_EXPECTED       0x47
 #define FIFO_WATERMARK_BYTES    64u  
 #define FIFO_PACKET_SIZE        16u
@@ -47,7 +46,7 @@
 
 // (-1) == reverse & 1 == normal
 #define M_ROLL                  -1 
-#define M_PITCH                   1 
+#define M_PITCH                  1 
 #define M_YAW                   -1 
 
 typedef struct {
@@ -215,26 +214,33 @@ static bool calibrate_gyro(uint16_t samples) {
 
 static float q[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // w, x, y, z  (body relative to NED)
 static float gyro_bias_mahony[3] = {0.0f, 0.0f, 0.0f};
-static float gain;
+static float gain_KI;
+static float gain_KP;
 static float norm;
+static float s_lp;
 #define MAHONY_KP_0  0.3f //0.3
 #define MAHONY_KI_0  0.1f //0.1
 
 
 
 static void mahony_update(float gx_rad, float gy_rad, float gz_rad, float ax_g, float ay_g, float az_g, float dt) {
-    float n = 8;
+    float np = 20;
+    float ni = 10;
     float K = 1;
 
     float ex = 0.0f, ey = 0.0f, ez = 0.0f;
 
     // Normalize accelerometer (only correct attitude when not in freefall)
     norm = sqrtf(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
-    gain = -((n*1 - n*norm)*(n*1 - n*norm)) + K;
-    gain = fmaxf(0.0f, gain); // clamped
+    s_lp += 0.02f * (norm - s_lp); 
+    gain_KP = -((np*1 - np*s_lp)*(np*1 - np*s_lp)) + K;
+    gain_KI = -((ni*1 - ni*s_lp)*(ni*1 - ni*s_lp)) + K;
+    gain_KP = fmaxf(0.0f, gain_KP); // clamped
+    gain_KI = fmaxf(0.0f, gain_KI); // clamped
 
-    float MAHONY_KP =  MAHONY_KP_0 * gain;
-    float MAHONY_KI =  MAHONY_KI_0 * gain;
+
+    float MAHONY_KP =  MAHONY_KP_0 * gain_KP;
+    float MAHONY_KI =  MAHONY_KI_0 * gain_KI;
 
     // change 
     if (norm > 0.1f) {
@@ -292,10 +298,6 @@ static void q_mirror(const float quatm[4]){
     qm[3] = quatm[3]*(M_YAW);
 }
 
-static void var_gain(){
-}
-
-
 static void quat_to_euler(const float quat[4], float *roll, float *pitch, float *yaw) {
     float w = quat[0], x = quat[1], y = quat[2], z = quat[3];
     *roll  = atan2f(2.0f*(w*x + y*z), 1.0f - 2.0f*(x*x + y*y));
@@ -345,14 +347,14 @@ int main(void) {
                        "A:%5.3f %5.3f %5.3f g | "
                        "Q:%6.3f %6.3f %6.3f %6.3f | "
                        "RPY:%5.1f %5.1f %5.1f deg\n"
-                       "Norm:%6.3f %6.3f ",
+                       "Norm:%6.3f %6.3f %6.3f\n",
                        gx_rad, gy_rad, gz_rad,
                        ax_g, ay_g, az_g,
                        qm[0], qm[1], qm[2], qm[3],
                        roll * 180.0f / M_PI,
                        pitch * 180.0f / M_PI,
                        yaw * 180.0f / M_PI,
-                       mag, gain);
+                       s_lp, gain_KI, gain_KP);
             }
         }
         sleep_ms(2);
