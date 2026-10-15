@@ -104,7 +104,6 @@ static bool ubx_rx_byte(uint8_t b)
     return false;
 }
 
-
 // explicit field-by-field decode
 // f points at the first payload byte (iTOW). Offsets match the u-blox spec.
 static void decode_nav_pvt(const uint8_t *f, nav_pvt_t *s) {
@@ -170,20 +169,6 @@ static void decode_nav_pvt(const uint8_t *f, nav_pvt_t *s) {
     s->magAcc = (uint16_t)f[90] | ((uint16_t)f[91] << 8);
 }
 
-static nav_pvt_t pvt;              // file scope, the one persistent copy
-
-static bool gps_update(void)
-{
-    bool fresh = false;
-    while (uart_is_readable(GPS_UART)) {
-        uint8_t b = (uint8_t)uart_getc(GPS_UART);
-        if (!ubx_rx_byte(b)) continue;
-        decode_nav_pvt(&frame[4], &pvt);
-        fresh = true;
-    }
-    return fresh;
-}
-
 void gps_driver_init(void){
     uart_init(GPS_UART, GPS_BAUD);
     gpio_set_function(GPS_TX_PIN, GPIO_FUNC_UART);
@@ -193,65 +178,26 @@ void gps_driver_init(void){
     uart_set_hw_flow(GPS_UART, false, false);
 }
 
-// helpers for integer-only string output 
-static int32_t iabs32(int32_t v) { return v < 0 ? -v : v; }
-
-
-void get_gps(nav_pvt_t *pvt){
-    gps_driver_init();
-    char line[200];
+static bool buffer_update(nav_pvt_t *pvt) {
+    bool fresh = false;
     while (uart_is_readable(GPS_UART)) {
-            uint8_t b = (uint8_t)uart_getc(GPS_UART);
-            if (ubx_rx_byte(b) == false) continue;      // keep feeding until a full valid PVT
-
-            // checksum passed, class/id/len confirmed -> decode
-            // frame 4 so frame[4] = f[0] in function, this is due to payload being different lenth than message 
-            decode_nav_pvt(&frame[4], *&pvt); 
-
-            if ((pvt->flags & 0x01) && pvt->fixType >= 2) {
-                // integer decomposition, no floats:
-                //   lat/lon are deg * 1e7 -> deg and 7-digit fraction
-                int32_t lat  = iabs32(pvt->lat);
-                int32_t lon  = iabs32(pvt->lon);
-                char ns = (pvt->lat < 0) ? 'S' : 'N';
-                char ew = (pvt->lon < 0) ? 'W' : 'E';
-                //   gSpeed mm/s -> 0.1 km/h
-                int32_t kmh10 = (pvt->gSpeed * 36) / 1000;
-                //   headMot deg * 1e-5 -> 0.1 deg
-                int32_t hdg10 = pvt->headMot / 10000;
-                //   hAcc mm -> m, pDOP * 0.01 -> integer part + 2-digit fraction
-                uint32_t hacc_m = pvt->hAcc / 1000;
-
-                snprintf(line, sizeof line,
-                    "%02u:%02u:%02u  "
-                    "Lat %ld.%07ld%c  Lon %ld.%07ld%c  "
-                    "Spd %ld.%ld km/h  Hdg %ld.%ld deg  "
-                    "fix=%u sats=%u hAcc=%lum pDOP=%u.%02u\r\n",
-                    (unsigned)pvt->hour, (unsigned)pvt->min, (unsigned)pvt->sec,
-                    (long)(lat / 10000000L), (long)(lat % 10000000L), ns,
-                    (long)(lon / 10000000L), (long)(lon % 10000000L), ew,
-                    (long)(kmh10 / 10), (long)(kmh10 % 10),
-                    (long)(hdg10 / 10), (long)(hdg10 % 10),
-                    (unsigned)pvt->fixType, (unsigned)pvt->numSV,
-                    (unsigned)hacc_m,
-                    (unsigned)(pvt->pDOP / 100), (unsigned)(pvt->pDOP % 100));
-
-                printf("%s", line);
-            } else {
-                printf("%02u:%02u:%02u  (acquiring... fixType=%u sats=%u)\r\n",
-                       (unsigned)pvt->hour, (unsigned)pvt->min, (unsigned)pvt->sec,
-                       (unsigned)pvt->fixType, (unsigned)pvt->numSV);
-            }
+        uint8_t b = (uint8_t)uart_getc(GPS_UART);
+        if (!ubx_rx_byte(b)) continue;
+        fresh = true;
     }
+    return fresh;
 }
 
-int main(void) {
-    stdio_init_all();
-    gps_driver_init();
-    while (!stdio_usb_connected()) sleep_ms(100);
-    printf("UBX NAV-PVT decoder started\r\n");
-    nav_pvt_t pvt;
-    while (true) {
-        get_gps(&pvt);
+// helpers for integer-only string output 
+int32_t iabs32(int32_t v) { return v < 0 ? -v : v; }
+
+bool gps_update(nav_pvt_t *pvt){
+    if(buffer_update(pvt)){
+        decode_nav_pvt(&frame[4], pvt);
+        return true;
+        }
+    return false;
+}
+
     }
 }
