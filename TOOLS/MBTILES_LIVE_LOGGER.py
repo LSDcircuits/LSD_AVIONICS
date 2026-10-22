@@ -17,7 +17,8 @@
 #
 # A sample is committed to CSV + the live map track when the
 # 'gainkp/gainki' line closes the block. hMSL is converted mm -> m.
-# Blocks without a GPS fix (the "acquiring..." ones) are discarded.
+# Blocks without a GPS fix (the "acquiring..." ones) are discarded, so a
+# header-only CSV means the GPS never got a fix during that session.
 #
 # Requires: pip install PySide6 pyserial
 
@@ -399,6 +400,11 @@ class TelemetryParser:
         m = TEMP_RE.search(line)
         if m:
             self.temp = float(m.group("value"))
+            return None
+
+        m = PRESS_RE.search(line)
+        if m:
+            self.press = float(m.group("value"))
             return None
 
         m = PRESS_ALT_RE.search(line)
