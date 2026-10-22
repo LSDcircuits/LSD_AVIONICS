@@ -6,15 +6,18 @@
 #         pan with left-drag, wheel zooms toward cursor, tiles load in a
 #         worker thread so the GUI never blocks on the DB.
 #
-# Logger: reads your 5-line telemetry block over serial:
-#   Q:-0.936 -0.021  0.006 -0.351        <- quaternions (w x y z)
-#   A: 0.072  0.045  1.044 -0.351        <- acceleration (x y z, norm)
-#   Lat 19.7003479  Lon -71.4378668  hMSL 6492 mm  fix=3  sats=6
-#   temp : 24.320
-#   press: 101194.045
+# Logger: reads your telemetry block over serial:
+#   Lat 19.7003242  Lon -71.4378893  hMSL 5566 mm  fix=3  sats=5
+#   Q: 0.061 -0.009  1.000 -0.284       <- quaternions (w x y z)
+#   A: 0.072  0.045  1.044 -0.351       <- acceleration (x y z [norm])
+#   temp : 24.508
+#   press: 101189.373
+#   press_alt :  0.099                  <- barometric altitude (m)
+#   gainkp :  0.999 gainki :  1.000     <- attitude filter gains
 #
-# A sample is committed to CSV + the live map track when the 'press' line
-# closes the block. hMSL is converted mm -> m in the CSV.
+# A sample is committed to CSV + the live map track when the
+# 'gainkp/gainki' line closes the block. hMSL is converted mm -> m.
+# Blocks without a GPS fix (the "acquiring..." ones) are discarded.
 #
 # Requires: pip install PySide6 pyserial
 
@@ -54,11 +57,15 @@ LATLON_RE = re.compile(
     re.IGNORECASE)
 TEMP_RE = re.compile(r"temp\s*[:=]?\s*(?P<value>%s)" % NUM, re.IGNORECASE)
 PRESS_RE = re.compile(r"press\s*[:=]?\s*(?P<value>%s)" % NUM, re.IGNORECASE)
+PRESS_ALT_RE = re.compile(r"press_alt\s*[:=]?\s*(?P<value>%s)" % NUM, re.IGNORECASE)
+GAIN_RE = re.compile(r"gainkp\s*[:=]?\s*(?P<kp>%s)\s+gainki\s*[:=]?\s*(?P<ki>%s)" % (NUM, NUM),
+                     re.IGNORECASE)
 
 CSV_HEADER = ["time_pc", "qw", "qx", "qy", "qz",
               "ax", "ay", "az",
               "lat_deg", "lon_deg", "hmsl_m",
-              "fix", "sats", "temp_c", "press_pa"]
+              "fix", "sats", "temp_c", "press_pa", "press_alt_m",
+              "gainkp", "gainki"]
 
 
 # ---------------- slippy map math ----------------
@@ -275,37 +282,40 @@ class MapView(QGraphicsView):
             self.cache.pop(next(iter(self.cache)))
 
     def drawForeground(self, painter, rect):
-        # everything here is in scene coordinates -> moves with pan/zoom
-        # wrapped in try/except: an exception must NEVER escape a paint
-        # override - repeated escapes segfault Qt
+        # an exception must NEVER escape a paint override -
+        # repeated escapes segfault Qt, so the whole overlay is guarded
         try:
-            if len(self.track) >= 2:
-                pen_casing = QPen(QColor(17, 24, 39, 200), 7)
-                pen_line = QPen(QColor(0, 166, 255, 245), 4)
-                pen_casing.setCapStyle(Qt.RoundCap)
-                pen_casing.setJoinStyle(Qt.RoundJoin)
-                pen_line.setCapStyle(Qt.RoundCap)
-                pen_line.setJoinStyle(Qt.RoundJoin)
-
-                for pen in (pen_casing, pen_line):
-                    painter.setPen(pen)
-                    # decimate when the track is long so painting stays fast
-                    step = max(1, len(self.track) // 4000)
-                    pts = self.track[::step]
-                    if pts[-1] != self.track[-1]:
-                        pts.append(self.track[-1])
-                    # PySide6 drawPolyline needs a QPolygonF, not list-of-tuples
-                    poly = QPolygonF([QPointF(*lonlat_to_global_px(lon, lat, self.z))
-                                      for lon, lat in pts])
-                    painter.drawPolyline(poly)
-
-            if self.latest is not None:
-                x, y = lonlat_to_global_px(*self.latest, self.z)
-                painter.setPen(QPen(QColor(255, 255, 255), 2))
-                painter.setBrush(QColor(239, 68, 68))
-                painter.drawEllipse(QRectF(x - 7, y - 7, 14, 14))
+            self._draw_overlay(painter)
         except Exception:
             pass   # degrade gracefully; never let paint crash the app
+
+    def _draw_overlay(self, painter):
+        # everything here is in scene coordinates -> moves with pan/zoom
+        if len(self.track) >= 2:
+            pen_casing = QPen(QColor(17, 24, 39, 200), 7)
+            pen_line = QPen(QColor(0, 166, 255, 245), 4)
+            pen_casing.setCapStyle(Qt.RoundCap)
+            pen_casing.setJoinStyle(Qt.RoundJoin)
+            pen_line.setCapStyle(Qt.RoundCap)
+            pen_line.setJoinStyle(Qt.RoundJoin)
+
+            for pen in (pen_casing, pen_line):
+                painter.setPen(pen)
+                # decimate when the track is long so painting stays fast
+                step = max(1, len(self.track) // 4000)
+                pts = self.track[::step]
+                if pts[-1] != self.track[-1]:
+                    pts.append(self.track[-1])
+                # PySide6 drawPolyline needs a QPolygonF, not list-of-tuples
+                poly = QPolygonF([QPointF(*lonlat_to_global_px(lon, lat, self.z))
+                                  for lon, lat in pts])
+                painter.drawPolyline(poly)
+
+        if self.latest is not None:
+            x, y = lonlat_to_global_px(*self.latest, self.z)
+            painter.setPen(QPen(QColor(255, 255, 255), 2))
+            painter.setBrush(QColor(239, 68, 68))
+            painter.drawEllipse(QRectF(x - 7, y - 7, 14, 14))
 
     def mouseMoveEvent(self, event: QMouseEvent):
         sp = self.mapToScene(event.position().toPoint())
@@ -346,8 +356,9 @@ class SerialReader(QThread):
 
 # ---------------- telemetry block parser ----------------
 class TelemetryParser:
-    """Accumulates the 5-line block; emits a complete sample when
-    the 'press' line closes the block."""
+    """Accumulates the telemetry block; emits a complete sample when the
+    'gainkp/gainki' line closes the block (that is the last line your MCU
+    prints in both the fixed and the acquiring branches)."""
 
     def __init__(self):
         self.reset()
@@ -358,6 +369,8 @@ class TelemetryParser:
         self.gps = None
         self.temp = None
         self.press = None
+        self.press_alt = None
+        self.gains = None
 
     def feed(self, line):
         """Returns a complete sample dict or None."""
@@ -388,10 +401,17 @@ class TelemetryParser:
             self.temp = float(m.group("value"))
             return None
 
-        m = PRESS_RE.search(line)
+        m = PRESS_ALT_RE.search(line)
         if m:
-            self.press = float(m.group("value"))
-            # block closes here -> commit if we at least have a GPS fix
+            self.press_alt = float(m.group("value"))
+            return None
+
+        m = GAIN_RE.search(line)
+        if m:
+            self.gains = (float(m.group("kp")), float(m.group("ki")))
+            # the gainkp/gainki line is the LAST line of the block in both
+            # the fixed and acquiring branches -> commit here, so kp/ki
+            # land in the same CSV row as the rest of the sample
             if self.gps is not None:
                 sample = {
                     "time_pc": datetime.now().strftime("%H:%M:%S.%f")[:-3],
@@ -409,10 +429,13 @@ class TelemetryParser:
                     "sats": self.gps["sats"],
                     "temp_c": self.temp if self.temp is not None else "",
                     "press_pa": self.press,
+                    "press_alt_m": self.press_alt if self.press_alt is not None else "",
+                    "gainkp": self.gains[0] if self.gains else "",
+                    "gainki": self.gains[1] if self.gains else "",
                 }
                 self.reset()
                 return sample
-            self.reset()   # incomplete block, discard
+            self.reset()   # incomplete block (e.g. acquiring...), discard
         return None
 
 
@@ -670,12 +693,14 @@ class MainWindow(QWidget):
 
         self.latest_label.setText(
             "Latest fix: %s | %.7f, %.7f | hMSL %.1f m | fix=%d sats=%d | "
-            "Q(%.3f %.3f %.3f %.3f) A(%.3f %.3f %.3f) | %.2f C, %.0f Pa"
+            "Q(%.3f %.3f %.3f %.3f) A(%.3f %.3f %.3f) | %.2f C, %.0f Pa, alt %.2f m | kp %.3f ki %.3f"
             % (sample["time_pc"], sample["lat_deg"], sample["lon_deg"],
                sample["hmsl_m"], sample["fix"], sample["sats"],
                _v(sample["qw"]), _v(sample["qx"]), _v(sample["qy"]), _v(sample["qz"]),
                _v(sample["ax"]), _v(sample["ay"]), _v(sample["az"]),
-               _v(sample["temp_c"]), sample["press_pa"]))
+               _v(sample["temp_c"]), sample["press_pa"],
+               _v(sample["press_alt_m"]),
+               _v(sample["gainkp"]), _v(sample["gainki"])))
 
         # csv
         if self.logging and self.csv_writer:
