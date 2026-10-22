@@ -105,3 +105,28 @@ void get_pt(pt_t *out){
     out->temp  = (double)t;
     out->press = (double)p;
 }
+
+double get_po(pt_t *out, double n){
+    double sum = 0.0;
+    for(int i = 0; i < n; i++){
+        get_pt(out);
+        sum += out->press;
+        sleep_ms(160);
+    }
+    return sum / n;
+}
+
+// Isothermal, using measured temperature (T in °C)
+double alt_isothermal(double p, double p0, double temp_c) {
+    return (287.05 * (temp_c + 273.15) / 9.80665) * log(p0 / p);
+}
+
+double get_initial_alt(pt_t *out, double p0, double n){
+    double sum = 0.0;
+    for(int i = 0 ; i < n; i++){
+        get_pt(out);
+        sum += alt_isothermal(out->press, p0, out->temp);
+        sleep_ms(160);
+    }
+    return sum / n; 
+}
