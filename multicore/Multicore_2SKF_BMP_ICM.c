@@ -54,6 +54,7 @@ typedef struct {
     uint32_t predictions;
     uint32_t baro_updates;
     uint32_t stale;
+
 } nav_pub_t;
 
 static queue_t baro_queue;
@@ -71,23 +72,37 @@ static volatile bool imu_failed = false;
 static struct {
     float x[2];
     float P[2][2];
-
     bool initialized;
-
     float dt_s;
     uint32_t predictions;
     uint32_t baro_updates;
     uint32_t stale;
 } kf;
 
-static void kf_reset(void)
-{
-    memset(&kf, 0, sizeof(kf));
-    kf.initialized = false;
+static void kf_reset(void) {
+    // memset used to dump vals in Kf (&add, value, size of struct)
+    memset(&kf, 0, sizeof(kf)); // sets all values in kf to 0.
+    kf.initialized = false; // set handler to false
+    // resets entire Kf in one operation
 }
+/* its equivalent of memset(&kf, 0, sizeof(kf));
+kf.x[0] = 0.0f;
+kf.x[1] = 0.0f;
 
-static void kf_predict(float acc_up, float dt)
-{
+kf.P[0][0] = 0.0f;
+kf.P[0][1] = 0.0f;
+kf.P[1][0] = 0.0f;
+kf.P[1][1] = 0.0f;
+
+kf.initialized = false;
+
+kf.dt_s = 0.0f;
+kf.predictions = 0;
+kf.baro_updates = 0;
+kf.stale = 0;
+*/
+
+static void kf_predict(float acc_up, float dt) {
     if (!kf.initialized ||
         !isfinite(acc_up) ||
         !(dt > 0.0f) ||
@@ -98,23 +113,13 @@ static void kf_predict(float acc_up, float dt)
     float dt2 = dt * dt;
     float dt3 = dt2 * dt;
 
-    /*
-     * State prediction:
-     *
-     * z = z + v*dt + 0.5*a*dt^2
-     * v = v + a*dt
-     */
-    kf.x[0] += kf.x[1] * dt
-             + 0.5f * acc_up * dt2;
+    //State prediction:
+    kf.x[0] += kf.x[1] * dt + 0.5f * acc_up * dt2;
 
     kf.x[1] += acc_up * dt;
 
-    /*
-     * Covariance prediction:
-     *
-     * F = [1 dt]
-     *     [0  1]
-     */
+
+    // Covariance prediction:
     float p00 = kf.P[0][0];
     float p01 = kf.P[0][1];
     float p11 = kf.P[1][1];
@@ -135,9 +140,8 @@ static void kf_update_baro(float z_baro) {
         return;
     }
 
-    /*
-     * Initialize directly from the first valid BMP measurement.
-     */
+   // Initialize directly from the first valid BMP measurement.
+
     if (!kf.initialized) {
         memset(kf.P, 0, sizeof(kf.P));
 
@@ -154,24 +158,17 @@ static void kf_update_baro(float z_baro) {
         return;
     }
 
-    /*
-     * Barometer measurement:
-     *
-     * z_baro = z + noise
-     * H = [1 0]
-     *
-     * Every finite BMP measurement is accepted.
-     * There is deliberately no innovation gate.
-     */
+    
+    // Barometer measurement:
+    // Every finite BMP measurement is accepted.
+    // There is deliberately no innovation gate.
     float R = BARO_STD_M * BARO_STD_M;
     float innovation =z_baro - kf.x[0];
     float S = kf.P[0][0] + R;
 
     if (!(S > 0.0f) || !isfinite(S)) {
-        /*
-         * This should never happen normally.
-         * Restart rather than allowing invalid covariance to propagate.
-         */
+    // this should never happen normally.
+    // Restart rather than allowing invalid covariance to propagate.
         kf_reset();
         return;
     }
@@ -187,9 +184,9 @@ static void kf_update_baro(float z_baro) {
     kf.x[0] += K0 * innovation;
     kf.x[1] += K1 * innovation;
 
-    /*
-     * Joseph covariance update for H = [1, 0].
-     */
+
+    //Joseph covariance update for H = [1, 0].
+
     kf.P[0][0] = (1.0f - K0) * (1.0f - K0) * p00 + K0 * K0 * R;
     kf.P[0][1] = (1.0f - K0) * (p01 - K1 * p00) + K0 * K1 * R;
     kf.P[1][0] = kf.P[0][1];
@@ -198,15 +195,13 @@ static void kf_update_baro(float z_baro) {
     kf.baro_updates++;
 }
 
-static void publish_nav(void)
-{
+static void publish_nav(void) {
     mutex_enter_blocking(&nav_mutex);
 
     nav_pub.z_m = kf.x[0];
     nav_pub.v_mps = kf.x[1];
     nav_pub.acc_up_mps2 = icm.acc_up;
     nav_pub.dt_s = kf.dt_s;
-
     nav_pub.predictions = kf.predictions;
     nav_pub.baro_updates = kf.baro_updates;
     nav_pub.stale = kf.stale;
@@ -216,11 +211,10 @@ static void publish_nav(void)
 
 /* ---------------- Core 1: ICM and Kalman filter ---------------- */
 
-void attitude_core(void)
-{
+void attitude_core(void) {
+
     if (!imu_init()) {
         imu_failed = true;
-
         while (true) {
             tight_loop_contents();
         }
@@ -230,17 +224,14 @@ void attitude_core(void)
 
     if (!calibrate_imu(2000)) {
         imu_failed = true;
-
         while (true) {
             tight_loop_contents();
         }
     }
 
     kf_reset();
-
     icm_t previous_icm;
     memset(&previous_icm, 0, sizeof(previous_icm));
-
     bool have_previous = false;
     uint64_t previous_ts = 0;
     uint64_t next_publish = time_us_64();
@@ -248,9 +239,9 @@ void attitude_core(void)
     imu_ready = true;
 
     while (true) {
-        /*
-         * Consume every available BMP measurement once.
-         */
+
+        // Consume every available BMP measurement once.
+
         baro_msg_t msg;
 
         while (queue_try_remove(&baro_queue, &msg)) {
@@ -266,10 +257,10 @@ void attitude_core(void)
 
         get_imu(&icm);
 
-        /*
-         * get_imu() leaves its output unchanged if no FIFO packet
-         * was available. Do not integrate stale acc_up repeatedly.
-         */
+
+        //get_imu() leaves its output unchanged if no FIFO packet
+        //was available. Do not integrate stale acc_up repeatedly.
+
         bool fresh =
             !have_previous ||
             memcmp(&icm, &previous_icm, sizeof(icm)) != 0;
@@ -285,8 +276,7 @@ void attitude_core(void)
         }
         uint64_t now = time_us_64();
         if ((int64_t)(now - next_publish) >= 0) {
-            next_publish =
-                now + NAV_PUBLISH_PERIOD_US;
+            next_publish = now + NAV_PUBLISH_PERIOD_US;
 
             publish_nav();
         }
@@ -307,15 +297,15 @@ int main(void) {
             tight_loop_contents();
         }
     }
-    /*
-     * Allow the BMP configuration and conversions to stabilize.
-     */
+
+     //Allow the BMP configuration and conversions to stabilize.
+
     sleep_ms(1000);
 
-    /*
-     * Establish pressure reference while stationary.
-     * Twenty samples at 160 ms each takes about 3.2 seconds.
-     */
+
+     //Establish pressure reference while stationary.
+     //Twenty samples at 160 ms each takes about 3.2 seconds.
+
     get_p0(&bmp, 20);
 
     printf("BMP reference p0 = %.3f Pa\n",(double)bmp.p0);
