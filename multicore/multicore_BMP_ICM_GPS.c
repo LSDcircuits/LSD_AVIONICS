@@ -1,4 +1,3 @@
-
 #include <stdio.h>
 #include "pico/stdlib.h"
 #include <math.h>
@@ -32,15 +31,15 @@ void main(){
     while (!stdio_usb_connected()) sleep_ms(100);
     printf("UBX NAV-PVT decoder started\r\n");
 
-    double p0 = get_po(&out, 10);
-    double initial_alt = get_initial_alt(&out, p0, 10);
+    get_p0(&out, 10);
+    get_initial_alt(&out, 10);
     double alt = 0;
 
     while (1) {
         if (gps_update(&pvt)) {
             if ((pvt.flags & 0x01) && pvt.fixType >= 2) {
-                get_pt(&out);
-                alt = alt_isothermal(out.press, p0, out.temp) - initial_alt;
+                get_bmp(&out);
+                alt = out.bmp_z;
 
                 printf("Lat %ld.%07ld  Lon %ld.%07ld  hMSL %ld mm  fix=%u  sats=%u\r\n",
                     (long)(pvt.lat / 10000000L), (long)(iabs32(pvt.lat) % 10000000L),
@@ -55,8 +54,8 @@ void main(){
                 sleep_ms(160);
 
             } else {
-                get_pt(&out);
-                alt = alt_isothermal(out.press, p0, out.temp) - initial_alt;
+                get_bmp(&out);
+                alt = out.bmp_z;
                 printf("acquiring... fixType=%u sats=%u\r\n",
                         pvt.fixType, pvt.numSV);
                 printf("temp : %6.3f\npress: %6.3f\n", out.temp, out.press);
@@ -68,4 +67,5 @@ void main(){
             tight_loop_contents();
         }
     }
+}
 }
